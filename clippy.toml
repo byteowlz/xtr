@@ -1,0 +1,33 @@
+# ============================================
+# CLIPPY CONFIGURATION
+# ============================================
+# These thresholds complement the lint configuration in Cargo.toml
+
+# Complexity thresholds - prevent sprawling functions
+cognitive-complexity-threshold = 20
+type-complexity-threshold = 200
+too-many-lines-threshold = 160
+
+# Domain terms that shouldn't trigger spelling warnings in docs
+doc-valid-idents = [
+    "GEPA",     # Guided Evolution of Prompts and Adapters
+    "XTR",      # Structured data extraction engine
+    "DSPy",     # Declarative Self-improving Python (Rust port: dspy-rs / DSRs)
+    "DSRs",     # DSPy Rust
+    "LLM",      # Large Language Model
+    "LM",       # Language Model
+    "MCP",      # Model Context Protocol
+    "JSON",     # JavaScript Object Notation
+    "JSONL",    # JSON Lines
+    "TOML",     # Tom's Obvious Minimal Language
+    "MLflow",   # Experiment tracking platform
+    "OpenAI",   # Provider / API style
+    "Anthropic",# Provider
+    "Schema",   # JSON Schema
+    "API",      # Application Programming Interface
+    "CLI",      # Command Line Interface
+    "HTTP",     # HyperText Transfer Protocol
+    "URL",      # Uniform Resource Locator
+    "AI",       # Artificial Intelligence
+    "CoT",      # Chain of Thought
+]

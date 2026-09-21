@@ -95,8 +95,8 @@ impl GepaLogger {
         use std::time::UNIX_EPOCH;
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         format!("{timestamp}")
     }
 
@@ -228,15 +228,12 @@ impl GepaLogger {
             }
             self.log_to_file("candidates.md", &candidates_md)?;
 
-            eprintln!(
-                "\n✓ Local logs saved to: {}",
-                self.log_dir
-                    .as_ref()
-                    .unwrap()
-                    .join(&self.task_name)
-                    .join(&self.run_id)
-                    .display()
-            );
+            if let Some(dir) = &self.log_dir {
+                eprintln!(
+                    "\n✓ Local logs saved to: {}",
+                    dir.join(&self.task_name).join(&self.run_id).display()
+                );
+            }
         }
 
         #[cfg(not(feature = "mlflow"))]

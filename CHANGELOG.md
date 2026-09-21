@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Build
+
+- Conformance to byteowlz workspace standards: added `CONTEXT.md`, `docs/adr/`
+  (template + README), `clippy.toml`, `.ast-grep/rules/`, and
+  `scripts/drift-check.sh`; rewrote `AGENTS.md` with source-of-truth,
+  strict-lint, and JSON/TOML-preference guidance; added workspace lints and the
+  `just check-all` gate.
+- Added `[workspace.dependencies]`/`[workspace.package]` and per-crate
+  `[lints] workspace = true`; crates inherit version/license/repository from
+  the workspace root.
+
+### Fixes
+
+- Removed production `unwrap`/`expect` in `xtr-cli` and `xtr-core`
+  (`strip_think_tags` now uses a lazily-initialized static regex, `log_dir`
+  writes are guarded, `file_name` uses a safe fallback).
+- Replaced the `unsafe` libc `getrlimit`/`setrlimit` calls in `increase_fd_limit`
+  with the safe `rustix` API.
+- Allowed `unsafe`/`unwrap`/`expect` only in `#[cfg(test)]` builds (test code
+  isolates env state via `env::set_var` and unwraps fixtures).
+
 ## 2026.1.25
 
 ### Highlights

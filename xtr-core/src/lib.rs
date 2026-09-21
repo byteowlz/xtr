@@ -1,6 +1,18 @@
 //! Core library for the XTR structured data extraction engine.
 
-extern crate rig;
+// Tests isolate global env state (e.g. `XDG_CONFIG_HOME`) via `env::set_var`,
+// which is `unsafe` in recent Rust, and idiomatically `unwrap`/`expect` on
+// fixtures. These `unwrap`/`expect`/`unsafe` lints apply to production code;
+// allow them only in test builds.
+#![cfg_attr(
+    test,
+    allow(
+        unsafe_code,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "test code isolates env state (unsafe env::set_var) and unwraps fixtures"
+    )
+)]
 
 pub mod config;
 pub mod engine;

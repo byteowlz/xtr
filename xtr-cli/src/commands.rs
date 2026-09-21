@@ -107,8 +107,12 @@ pub fn handle_history(engine: &ExtractionEngine, task: Option<&str>, detailed: b
 
             let relative_path = format!(
                 "{}/{}",
-                date_path.file_name().unwrap().to_string_lossy(),
-                run_path.file_name().unwrap().to_string_lossy()
+                date_path
+                    .file_name()
+                    .map_or_else(|| "".into(), |n| n.to_string_lossy().into_owned()),
+                run_path
+                    .file_name()
+                    .map_or_else(|| "".into(), |n| n.to_string_lossy().into_owned())
             );
 
             runs.push((relative_path, run_task.to_string(), metrics));

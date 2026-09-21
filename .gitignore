@@ -1,3 +1,20 @@
 /target
 target/
-docs/
+
+# Generated documentation output (but keep docs/adr/ decision records)
+docs/*
+!docs/adr/
+
+.tmp/
+*.tmp
+
+# Local tooling
+.env
+.DS_Store
+.vscode/
+.idea/
+
+# Byteowlz release artifacts
+/release/
+*.tar.gz
+checksums.txt

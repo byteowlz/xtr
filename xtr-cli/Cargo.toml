@@ -1,26 +1,29 @@
 [package]
 name = "xtr-cli"
-version = "0.3.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Command-line interface for XTR - structured data extraction from unstructured text"
-license = "MIT"
-repository = "https://github.com/byteowlz/xtr"
-homepage = "https://github.com/byteowlz/xtr"
-documentation = "https://github.com/byteowlz/xtr#readme"
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
 publish = false
 
 [dependencies]
-anyhow = "1"
-xtr-core = { path = "../xtr-core" }
-tokio = { version = "1.40", features = ["macros", "rt-multi-thread"] }
-clap = { version = "4", features = ["derive"] }
-serde_json = "1"
-chrono = "0.4"
-json-schema-generator = "0.1.1"
+anyhow.workspace = true
+xtr-core.workspace = true
+tokio.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+json-schema-generator.workspace = true
 
 [[bin]]
 name = "xtr"
 path = "src/main.rs"
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc.workspace = true
+rustix = { version = "1.1", default-features = false, features = ["process", "std"] }
+
+[lints]
+workspace = true

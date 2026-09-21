@@ -33,27 +33,19 @@ impl From<CliValidationMode> for xtr_core::ValidationMode {
 
 #[cfg(unix)]
 fn increase_fd_limit() -> Result<()> {
-    use anyhow::anyhow;
+    use rustix::process::Resource;
+    use rustix::process::getrlimit;
+    use rustix::process::setrlimit;
 
-    let mut limits = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
+    let limits = getrlimit(Resource::Nofile);
+    let target = limits.maximum.map_or(10240, |max| max.min(10240));
+    let new = rustix::process::Rlimit {
+        current: Some(target),
+        maximum: limits.maximum,
     };
 
-    unsafe {
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) != 0 {
-            return Err(anyhow!("failed to get file descriptor limit"));
-        }
-
-        limits.rlim_cur = if limits.rlim_max == libc::RLIM_INFINITY {
-            10240
-        } else {
-            limits.rlim_max.min(10240)
-        };
-
-        if libc::setrlimit(libc::RLIMIT_NOFILE, &limits) != 0 {
-            eprintln!("Warning: failed to increase file descriptor limit");
-        }
+    if let Err(err) = setrlimit(Resource::Nofile, new) {
+        eprintln!("Warning: failed to increase file descriptor limit: {err}");
     }
 
     Ok(())

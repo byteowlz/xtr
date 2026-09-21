@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 
 use anyhow::Context;
@@ -24,6 +25,14 @@ use serde_json::Value;
 
 use crate::config::ModelDescriptor;
 use crate::config::ResolvedModelConfig;
+
+/// Matches ” thinking... response ” tags (case-insensitive, multi-line) to strip.
+#[expect(
+    clippy::expect_used,
+    reason = "regex pattern is a compile-time literal that is guaranteed valid"
+)]
+static THINK_TAGS_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?is) thinking.*? response").expect("valid static regex"));
 
 /// Global state for verbose LLM logging
 static VERBOSE_LLM_LOGGING: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -194,24 +203,14 @@ impl JsonAdapter {
             let value = demo.get(field_name.as_str(), None);
             let as_string = Self::value_to_string(value);
 
-            if field_name == "output_json" {
-                response_object.insert(field_name.clone(), Value::String(as_string));
-            } else {
-                response_object.insert(field_name.clone(), Value::String(as_string));
-            }
+            response_object.insert(field_name.clone(), Value::String(as_string));
         }
 
         (user, Value::Object(response_object).to_string())
     }
 
     fn strip_think_tags(text: &str) -> String {
-        let mut result = text.to_string();
-
-        // Remove <think>...</think> tags (case insensitive, handles newlines)
-        let re = regex::Regex::new(r"(?is)<think>.*?</think>").unwrap();
-        result = re.replace_all(&result, "").to_string();
-
-        result.trim().to_string()
+        THINK_TAGS_RE.replace_all(text, "").trim().to_string()
     }
 
     fn extract_json_payload(raw: &str) -> Option<Value> {

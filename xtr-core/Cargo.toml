@@ -1,34 +1,36 @@
 [package]
 name = "xtr-core"
-version = "0.3.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Core extraction engine for XTR - structured data extraction powered by GEPA"
-license = "MIT"
-repository = "https://github.com/byteowlz/xtr"
-homepage = "https://github.com/byteowlz/xtr"
-documentation = "https://github.com/byteowlz/xtr#readme"
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
 publish = false
 
 [features]
 default = []
-mlflow = ["mlflow_rs"]
+mlflow = ["dep:mlflow_rs"]
 
 [dependencies]
-anyhow = "1"
-config = { version = "0.14", default-features = false, features = ["toml"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-shellexpand = "3"
-dspy-rs = { version = "0.7.3", package = "dspy-rs" }
-tokio = { version = "1.40", features = ["macros", "rt-multi-thread"] }
-bon = "3.8.1"
-jsonschema = "0.17"
-indexmap = "2.2"
-async-trait = "0.1"
+anyhow.workspace = true
+config.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shellexpand.workspace = true
+dspy-rs.workspace = true
+tokio.workspace = true
+bon.workspace = true
+jsonschema.workspace = true
+indexmap.workspace = true
+async-trait.workspace = true
 mlflow_rs = { version = "0.1", optional = true }
-chrono = "0.4"
-regex = "1"
-rig-core = "0.22"
+chrono.workspace = true
+regex.workspace = true
+rig-core.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true
+
+[lints]
+workspace = true

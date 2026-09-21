@@ -5,3 +5,112 @@ members = [
     "xtr-cli",
     "xtr-api",
 ]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/byteowlz/xtr"
+readme = "README.md"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shellexpand = "3"
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread"] }
+chrono = "0.4"
+regex = "1"
+config = { version = "0.14", default-features = false, features = ["toml"] }
+tempfile = "3"
+xtr-core = { path = "xtr-core" }
+
+# xtr-core only
+dspy-rs = "0.7.3"
+bon = "3.8.1"
+jsonschema = "0.17"
+indexmap = "2.2"
+async-trait = "0.1"
+rig-core = "0.22"
+
+# xtr-cli only
+clap = { version = "4", features = ["derive"] }
+json-schema-generator = "0.1.1"
+libc = "0.2"
+
+# ============================================
+# WORKSPACE LINT POSTURE (calibrated for mature code)
+# ============================================
+# Guardrails at deny, style/perf at warn, churn-heavy pedantic lints allowed.
+# Aligned with the posture the mature byteowlz codebase (oqto) enforces.
+
+[workspace.lints.rust]
+unsafe_code = "deny"  # allow() is honored in `#[cfg(test)]` (see crate lib.rs)
+non_ascii_idents = "forbid"
+warnings = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+future_incompatible = { level = "deny", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
+
+[workspace.lints.rustdoc]
+all = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+# === Guardrails (anti-AI-slop) ===
+all = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+allow_attributes_without_reason = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+# === ASYNC SAFETY ===
+await_holding_lock = "deny"
+large_futures = "deny"
+
+# === PROCESS/MEMORY SAFETY ===
+exit = "deny"
+mem_forget = "deny"
+
+# === PERFORMANCE ===
+large_stack_arrays = "deny"
+large_types_passed_by_value = "deny"
+
+# === STYLE / CORRECTNESS (curated, warn-level like oqto) ===
+collapsible_if = "warn"
+collapsible_else_if = "warn"
+needless_return = "warn"
+needless_borrow = "warn"
+clone_on_copy = "warn"
+single_char_add_str = "warn"
+manual_strip = "warn"
+manual_flatten = "warn"
+unnecessary_lazy_evaluations = "warn"
+unnecessary_map_or = "warn"
+io_other_error = "warn"
+single_match = "warn"
+cloned_instead_of_copied = "warn"
+inefficient_to_string = "warn"
+ptr_arg = "warn"
+derivable_impls = "warn"
+
+# === INTENTIONALLY ALLOWED (matches oqto; avoid churn on mature code) ===
+too_many_arguments = "allow"
+type_complexity = "allow"
+module_inception = "allow"
+multiple_crate_versions = "allow"
+struct_field_names = "allow"
+needless_pass_by_value = "allow"
+needless_pass_by_ref_mut = "allow"
+needless_borrows_for_generic_args = "allow"
+cognitive_complexity = "allow"
+print_stdout = "allow"
+print_stderr = "allow"
+struct_excessive_bools = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"
