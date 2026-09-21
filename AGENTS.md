@@ -6,7 +6,7 @@ config is the source of truth; this file only carries the enforceable rules.
 ## Source of truth
 
 - Crate list, deps, lints → root `Cargo.toml` (`cargo metadata --no-deps`).
-- Task commands → `just` (run `just` to list). Tests run via `cargo nextest`.
+- Task commands → `just` (run `just` to list). Tests run via `cargo test`.
 - Issues → `trx`. Drift guard → `scripts/drift-check.sh`.
 If they disagree with anything here, the command is right.
 

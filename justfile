@@ -33,9 +33,7 @@ install:
 install-all:
     ./scripts/install-xtr.sh
 
-# Run `cargo nextest` since it's faster than `cargo test`, though including
-# --no-fail-fast is important to ensure all tests are run.
-#
-# Run `cargo install cargo-nextest` if you don't have it installed.
+# Run the workspace test suite with default test's fail-fast on the first
+# failing binary. Matches the `check-all` gate.
 test:
-    cargo nextest run --no-fail-fast
+    cargo test --workspace --all-features
