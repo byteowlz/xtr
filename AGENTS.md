@@ -28,10 +28,14 @@ If they disagree with anything here, the command is right.
 `unwrap`/`expect`/`panic`/`todo`/`dbg_macro` are denied; propagate with `?` /
 `anyhow::Result` / `.context(...)`.
 
-## Formats
+## Formats & config
 
 Prefer **JSON/TOML** for config and machine output. Don't add `serde_yaml` as a
 new dependency; leave existing YAML alone.
+
+Config is loaded from `config.toml` via plain `toml` deserialization (see
+`xtr-core/src/config.rs`). There is **no external `config` crate**; path
+resolution is hand-rolled XDG (no `dirs` crate). Don't reintroduce either.
 
 ## Issue tracking
 

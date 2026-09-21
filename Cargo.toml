@@ -21,7 +21,7 @@ shellexpand = "3"
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread"] }
 chrono = "0.4"
 regex = "1"
-config = { version = "0.14", default-features = false, features = ["toml"] }
+toml = "0.8"
 tempfile = "3"
 xtr-core = { path = "xtr-core" }
 

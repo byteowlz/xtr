@@ -8,9 +8,6 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
-use config::Config as ConfigLoader;
-use config::Environment;
-use config::File;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -49,30 +46,19 @@ pub fn load_or_initialize_config(app_name: impl AsRef<str>) -> Result<ConfigBund
         })?;
     }
 
-    let env_prefix = app_name
-        .chars()
-        .map(|ch| if ch == '-' { '_' } else { ch })
-        .collect::<String>()
-        .to_ascii_uppercase();
+    let config_toml = fs::read_to_string(&paths.config_file).with_context(|| {
+        format!(
+            "failed to read configuration at {}",
+            paths.config_file.display()
+        )
+    })?;
 
-    let builder = ConfigLoader::builder()
-        .add_source(File::from(paths.config_file.clone()))
-        .add_source(
-            Environment::with_prefix(&env_prefix)
-                .separator("__")
-                .try_parsing(true),
-        );
-
-    let mut config: AppConfig = builder
-        .build()
-        .with_context(|| {
-            format!(
-                "failed to parse configuration at {}",
-                paths.config_file.display()
-            )
-        })?
-        .try_deserialize()
-        .context("failed to deserialize configuration into AppConfig")?;
+    let mut config: AppConfig = toml::from_str(&config_toml).with_context(|| {
+        format!(
+            "failed to parse configuration at {}",
+            paths.config_file.display()
+        )
+    })?;
 
     paths = paths.apply_storage_overrides(&config.storage)?;
     paths.ensure_runtime_dirs()?;
@@ -97,21 +83,15 @@ pub struct AppPaths {
 impl AppPaths {
     pub fn discover(app_name: impl Into<String>) -> Result<Self> {
         let app_name = app_name.into();
-        let home = home_dir().context("unable to determine home directory for XDG resolution")?;
 
-        let config_base = xdg_dir("XDG_CONFIG_HOME", &home, ".config");
-        let data_base = xdg_dir("XDG_DATA_HOME", &home, ".local/share");
-        let state_base = xdg_dir("XDG_STATE_HOME", &home, ".local/state");
-        let cache_base = env::var("XDG_CACHE_HOME")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| state_base.join("cache"));
-
-        let config_dir = config_base.join(&app_name);
-        let data_dir = data_base.join(&app_name);
-        let state_dir = state_base.join(&app_name);
-        let cache_dir = cache_base.join(&app_name);
+        let config_dir = base_dir("XDG_CONFIG_HOME", ".config", "APPDATA")?.join(&app_name);
+        let data_dir = base_dir("XDG_DATA_HOME", ".local/share", "APPDATA")?.join(&app_name);
+        let state_dir = base_dir("XDG_STATE_HOME", ".local/state", "LOCALAPPDATA")?.join(&app_name);
+        // Cache lives under an explicit XDG_CACHE_HOME if set, else under state/cache.
+        let cache_dir = match base_dir("XDG_CACHE_HOME", ".cache", "LOCALAPPDATA") {
+            Ok(base) => base.join(&app_name),
+            Err(_) => state_dir.join("cache"),
+        };
         let config_file = config_dir.join("config.toml");
 
         Ok(Self {
@@ -717,12 +697,39 @@ pub struct ResolvedTaskConfig {
     pub include_timestamp: bool,
 }
 
-fn xdg_dir(var: &str, home: &Path, fallback_suffix: &str) -> PathBuf {
-    env::var(var)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(fallback_suffix))
+/// Resolve a base directory deterministically (pure; unit-tested below).
+///
+/// An explicit, absolute `XDG_*` path wins on any OS; otherwise `~/<unix_rel>`
+/// on all unix **including macOS** (deliberately NOT `~/Library/Application
+/// Support` for CLI tools), or the Windows known directory.
+fn resolve_base(
+    xdg: Option<PathBuf>,
+    home: Option<PathBuf>,
+    win_dir: Option<PathBuf>,
+    is_windows: bool,
+    unix_rel: &str,
+) -> Option<PathBuf> {
+    if let Some(path) = xdg.filter(|p| p.is_absolute()) {
+        return Some(path);
+    }
+    if is_windows {
+        win_dir
+    } else {
+        home.map(|home| home.join(unix_rel))
+    }
+}
+
+/// Read the relevant env vars and resolve a base dir via [`resolve_base`].
+/// Zero-dependency: no `dirs` crate (whose macOS default we deliberately avoid).
+fn base_dir(xdg_var: &str, unix_rel: &str, win_var: &str) -> Result<PathBuf> {
+    resolve_base(
+        env::var_os(xdg_var).map(PathBuf::from),
+        env::var_os("HOME").map(PathBuf::from),
+        env::var_os(win_var).map(PathBuf::from),
+        cfg!(windows),
+        unix_rel,
+    )
+    .ok_or_else(|| anyhow!("unable to determine base directory ({xdg_var})"))
 }
 
 pub fn resolve_path_value(value: &str, base_dir: &Path) -> Result<PathBuf> {
@@ -783,6 +790,48 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn resolve_base_xdg_absolute_path_wins_on_any_os() {
+        let got = resolve_base(
+            Some(PathBuf::from("/explicit/xdg")),
+            Some(PathBuf::from("/home/u")),
+            Some(PathBuf::from("C:/Users/u/AppData/Roaming")),
+            true,
+            ".config",
+        );
+        assert_eq!(got, Some(PathBuf::from("/explicit/xdg")));
+    }
+
+    #[test]
+    fn resolve_base_unix_incl_macos_uses_home_dotpath_not_library() {
+        let got = resolve_base(None, Some(PathBuf::from("/home/u")), None, false, ".config");
+        assert_eq!(got, Some(PathBuf::from("/home/u/.config")));
+    }
+
+    #[test]
+    fn resolve_base_windows_uses_known_dir() {
+        let got = resolve_base(
+            None,
+            Some(PathBuf::from("C:/Users/u")),
+            Some(PathBuf::from("C:/Users/u/AppData/Roaming")),
+            true,
+            ".config",
+        );
+        assert_eq!(got, Some(PathBuf::from("C:/Users/u/AppData/Roaming")));
+    }
+
+    #[test]
+    fn resolve_base_relative_xdg_is_ignored() {
+        let got = resolve_base(
+            Some(PathBuf::from("relative/path")),
+            Some(PathBuf::from("/home/u")),
+            None,
+            false,
+            ".local/state",
+        );
+        assert_eq!(got, Some(PathBuf::from("/home/u/.local/state")));
     }
 
     #[test]

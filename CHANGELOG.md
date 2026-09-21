@@ -15,6 +15,17 @@ All notable changes to this project will be documented in this file.
   `[lints] workspace = true`; crates inherit version/license/repository from
   the workspace root.
 
+### Changed
+
+- **Dropped the external `config` crate**: configuration is now loaded from
+  `config.toml` via plain `toml` deserialization (the dormant `XTR__*` env-var
+  override layer was removed alongside it). Path resolution is hand-rolled XDG
+  (no `dirs` crate).
+- **Ported template XDG resolution**: `AppPaths::discover` now uses the
+  byteowlz template's `resolve_base`/`base_dir` helpers (absolute `XDG_*` wins,
+  `~/.config` on macOS rather than `~/Library`, Windows known-dirs), with unit
+  tests.
+
 ### Fixes
 
 - Removed production `unwrap`/`expect` in `xtr-cli` and `xtr-core`

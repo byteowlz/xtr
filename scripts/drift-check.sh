@@ -29,27 +29,22 @@ else
   echo "  ok: no serde_yaml dependency in any manifest"
 fi
 
-echo "==> Workspace config crate: default-features=false"
-python3 - "$FAILED" <<'PY'
-import sys
-from pathlib import Path
+echo "==> No external 'config' crate (use plain toml + XDG paths)"
+if rg -n '^config ' --glob 'Cargo.toml' . >/dev/null 2>&1; then
+  echo "  FAIL: found external 'config' crate dependency (prefer toml + hand-rolled XDG)"
+  rg -n '^config ' --glob 'Cargo.toml' . || true
+  FAILED=1
+else
+  echo "  ok: no external config crate dependency"
+fi
 
-failed = int(sys.argv[1])
-root = Path('.')
-for m in root.rglob('Cargo.toml'):
-    text = m.read_text()
-    for line in text.splitlines():
-        s = line.strip()
-        if s.startswith('config') and ('version' in s or 'features' in s):
-            if 'default-features = false' not in s:
-                print(f"  FAIL: {m}: config dep missing default-features = false")
-                failed = 1
-            if 'yaml' in s:
-                print(f"  FAIL: {m}: config dep enables yaml")
-                failed = 1
-sys.exit(failed)
-PY
-FAILED=$?
+echo "==> toml crate present for config parsing"
+if rg -n '^toml ' --glob 'Cargo.toml' . >/dev/null 2>&1; then
+  echo "  ok: toml crate present"
+else
+  echo "  FAIL: no toml crate dependency for config parsing"
+  FAILED=1
+fi
 
 echo "==> Workspace resolves (cargo metadata)"
 if cargo metadata --no-deps --format-version 1 >/dev/null 2>&1; then
