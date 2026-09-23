@@ -7,3 +7,7 @@ easily reversed implementation choices.
 Use sequential filenames such as `0001-storage-engine.md`. Start from
 `0000-template.md`, keep the record concise, and explain what was decided and
 why.
+
+| ADR | Decision |
+|-----|----------|
+| 0001 | Configurable metrics (MetricKind), task kinds (extract/grade), and judge-as-task |

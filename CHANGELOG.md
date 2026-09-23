@@ -4,7 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Added
+
+- **Configurable metrics per task** (`MetricKind`): choose how an extraction is
+  scored via `[tasks.<name>.metric].kind` — `schema_field` (default, existing
+  heuristic), `exact`, `llm_judge`, or `command`.
+- **Judge-as-task (`kind = "grade"`)**: a `grade` task rates a prediction
+  against an expected output and emits a verdict. Its instruction (the rubric)
+  can itself be optimized with `xtr optimize <judge_task>`.
+- **`verdict_schema`**: a JSON Schema the judge/command verdict must conform to
+  (defaults to `{score, feedback, reasons[]}`), validated before the score is
+  read. `rubric`/`verdict_schema` accept an inline value or an `@path` file ref.
+- **`command` metric**: shell out to a scorer; it receives a JSON doc on stdin
+  and writes a verdict to stdout (validated against `verdict_schema`).
+
 ### Build
+
+- Conformance to byteowlz workspace standards: added `CONTEXT.md`, `docs/adr/`
 
 - Conformance to byteowlz workspace standards: added `CONTEXT.md`, `docs/adr/`
   (template + README), `clippy.toml`, `.ast-grep/rules/`, and

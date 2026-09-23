@@ -127,3 +127,31 @@ _Avoid_: generator
 The unique identifier of an optimization run, used to activate/select the best
 instruction for a task.
 _Avoid_: run (ambiguous)
+
+**Task Kind**:
+What a task does. `extract` (default) turns unstructured input into structured
+JSON against a schema; `grade` is a judge task that rates a prediction against
+an expected output and emits a verdict. Both share the same optimization loop.
+_Avoid_: task type (ambiguous)
+
+**Metric Kind**:
+How an extraction is scored during optimization: `schema_field` (default),
+`exact`, `llm_judge`, or `command`. Selected per task via `[tasks.<name>.metric]`.
+_Avoid_: metric (the config-type name), scorer
+
+**Verdict Schema**:
+A JSON Schema describing the structured output a `grade`/`command` metric must
+emit (`{score, feedback, reasons[]}` by default). It is validated against the
+judge/command output, not the rubric.
+_Avoid_: judge schema
+
+**Rubric**:
+The prose grading instruction a `grade` task's judge reads. Plain text (inline
+or `@file`); it is the thing GEPA optimizes for a judge. Never
+schema-validated (unlike the verdict schema).
+_Avoid_: grading schema
+
+**Judge / Judge Task**:
+A reusable `grade` task used as an `llm_judge` scorer. It rates a predicted
+extraction against an expected output; its optimized instruction is the rubric.
+_Avoid_: grader (ambiguous)

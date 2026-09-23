@@ -194,6 +194,14 @@ impl AppConfig {
             .transpose()
             .with_context(|| format!("failed to resolve examples path for task {task_name}"))?;
 
+        // Resolve `@file` references (rubric, verdict_schema) inside the task's
+        // metric config relative to the config directory.
+        let metric_config = task_config
+            .and_then(|task| task.metric.as_ref())
+            .map(|metric| resolve_metric_files(metric, &paths.config_dir))
+            .transpose()
+            .with_context(|| format!("failed to resolve metric config for task {task_name}"))?;
+
         Ok(ResolvedTaskConfig {
             name: task_name.to_string(),
             description: task_config.and_then(|task| task.description.clone()),
@@ -204,6 +212,10 @@ impl AppConfig {
             include_timestamp: task_config
                 .and_then(|task| task.include_timestamp)
                 .unwrap_or(false),
+            kind: task_config
+                .and_then(|task| task.kind)
+                .unwrap_or(TaskKind::Extract),
+            metric: metric_config,
         })
     }
 
@@ -308,6 +320,55 @@ impl Default for MetricsConfig {
     }
 }
 
+/// The kind of work a task performs. `extract` is the default (unstructured
+/// input -> structured JSON). `grade` is a judge task: it rates a predicted
+/// extraction against an expected output and emits a verdict conforming to a
+/// `verdict_schema`. Both use the same optimization machinery.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    #[default]
+    Extract,
+    Grade,
+}
+
+/// How an extraction is scored during optimization.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricKind {
+    /// Schema + field-level match against an expected output (default).
+    #[default]
+    SchemaField,
+    /// Exact JSON equality against the expected output.
+    Exact,
+    /// Use a reusable grade task as an LLM judge; the rubric is that task's
+    /// instruction, optionally optimized by GEPA.
+    LlmJudge,
+    /// Shell out to a subprocess that scores a predicted output and writes a
+    /// verdict (conforming to `verdict_schema`) to stdout.
+    Command,
+}
+
+/// Per-task metric configuration, resolved into an `ExtractionProgram`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetricConfig {
+    /// Which scoring mechanism to use.
+    pub kind: MetricKind,
+    /// JSON Schema the judge/command verdict must conform to. A sensible
+    /// default (`{score, feedback, reasons[]}`) is used when unset.
+    pub verdict_schema: Option<String>,
+    /// Name of the reusable `grade` task to use as the `llm_judge` scorer.
+    pub judge_task: Option<String>,
+    /// Prose rubric for `llm_judge`, or `@path` to read it from a file. When
+    /// unset, the grade task's (possibly optimized) instruction is used.
+    pub rubric: Option<String>,
+    /// Subprocess command for `command` metrics (receives JSON on stdin).
+    pub command: Option<String>,
+    /// Timeout for a `command` metric.
+    pub timeout_secs: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 #[derive(Default)]
@@ -316,6 +377,8 @@ pub struct TaskConfig {
     pub examples: Option<String>,
     pub description: Option<String>,
     pub include_timestamp: Option<bool>,
+    pub kind: Option<TaskKind>,
+    pub metric: Option<MetricConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -695,6 +758,8 @@ pub struct ResolvedTaskConfig {
     pub models: ResolvedModelConfig,
     pub optimization: ResolvedOptimizationSettings,
     pub include_timestamp: bool,
+    pub kind: TaskKind,
+    pub metric: Option<MetricConfig>,
 }
 
 /// Resolve a base directory deterministically (pure; unit-tested below).
@@ -730,6 +795,31 @@ fn base_dir(xdg_var: &str, unix_rel: &str, win_var: &str) -> Result<PathBuf> {
         unix_rel,
     )
     .ok_or_else(|| anyhow!("unable to determine base directory ({xdg_var})"))
+}
+
+/// Resolve `@file` references in a metric config (`rubric`, `verdict_schema`)
+/// to their file contents, relative to `base_dir`. Values not starting with
+/// `@` are left as-is.
+fn resolve_metric_files(metric: &MetricConfig, base_dir: &Path) -> Result<MetricConfig> {
+    let mut next = metric.clone();
+    if let Some(value) = &next.rubric {
+        next.rubric = Some(resolve_file_ref(value, base_dir)?);
+    }
+    if let Some(value) = &next.verdict_schema {
+        next.verdict_schema = Some(resolve_file_ref(value, base_dir)?);
+    }
+    Ok(next)
+}
+
+/// Read the contents of a `@path` reference, or return the value unchanged if
+/// it does not start with `@`.
+fn resolve_file_ref(value: &str, base_dir: &Path) -> Result<String> {
+    let Some(ref_path) = value.strip_prefix('@') else {
+        return Ok(value.to_string());
+    };
+    let path = resolve_path_value(ref_path, base_dir)?;
+    fs::read_to_string(&path)
+        .with_context(|| format!("failed to read referenced file {}", path.display()))
 }
 
 pub fn resolve_path_value(value: &str, base_dir: &Path) -> Result<PathBuf> {

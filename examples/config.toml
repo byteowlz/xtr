@@ -37,6 +37,18 @@ field_weight = 0.5
 # Weight for coverage bonus (encourages completeness) (default: 0.1)
 coverage_weight = 0.1
 
+# Per-task metric choice. The built-in default is `schema_field` (field-level
+# schema matching). Other kinds:
+#   - `exact`: exact JSON equality against the expected output
+#   - `llm_judge`: rate via a reusable `grade` task; the rubric is that task's
+#     instruction, optionally optimized by GEPA
+#   - `command`: shell out to a scorer; it receives a JSON doc on stdin and must
+#     write a verdict (score/feedback) to stdout (validated against
+#     `verdict_schema`)
+# The `verdict_schema` (JSON Schema for the judge/command output) defaults to
+# `{score, feedback, reasons[]}`. `rubric` and `verdict_schema` accept either an
+# inline value or an `@path/to/file` reference.
+
 [models.defaults.teacher]
 name = "llama-teacher"
 base_url = "http://localhost:8080/v1"
@@ -143,6 +155,19 @@ examples = "~/data/xtr/examples/invoice"
 description = "Extract structured invoice metadata from scanned PDFs."
 # include_timestamp adds current date/time to the model's context (default: false)
 include_timestamp = false
+# Optional: choose a non-default metric for this task (default is `schema_field`).
+# [tasks."invoice_extraction".metric]
+# kind = "llm_judge"
+# judge_task = "verdict_judge"
+# rubric = "@~/data/xtr/rubrics/invoice.md"
+
+# A `grade` task is an LLM judge; its instruction (rubric) can itself be
+# optimized with `xtr optimize verdict_judge`.
+# [tasks."verdict_judge"]
+# kind = "grade"
+# schema = "~/data/xtr/schemas/verdict.json"
+# examples = "~/data/xtr/examples/verdict"
+# description = "Grade an invoice extraction against the gold output."
 
 [tasks."troubleshooting_report"]
 schema = "$XDG_DATA_HOME/xtr/schemas/troubleshooting.json"
