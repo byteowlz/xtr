@@ -103,16 +103,7 @@ impl Default for ExtractionProgram {
 
 impl ExtractionProgram {
     pub fn new() -> Self {
-        Self::builder()
-            .solver(Predict::new(ExtractionSignature::new()))
-            .build()
-    }
-
-    pub fn with_verbose(verbose: bool) -> Self {
-        Self::builder()
-            .solver(Predict::new(ExtractionSignature::new()))
-            .verbose(verbose)
-            .build()
+        Self::with_metrics_config(MetricsConfig::default())
     }
 
     pub fn with_metrics_config(metrics_config: MetricsConfig) -> Self {
@@ -833,7 +824,7 @@ impl GepaRunner {
         let train_examples: Vec<_> = dataset
             .iter()
             .map(|example| example.to_training_example(&schema, task.include_timestamp))
-            .collect();
+            .collect::<Result<_>>()?;
 
         let prompt_model = if let Some(descriptor) = optimization.feedback_models.teacher.clone() {
             let mut handle = build_model_handle(&descriptor).await?;

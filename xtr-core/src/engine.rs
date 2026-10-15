@@ -1,101 +1,78 @@
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
-use dspy_rs::Module;
 use dspy_rs::core::Optimizable as OptimizableTrait;
 use dspy_rs::example;
-use jsonschema::JSONSchema;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
+use crate::capture::CaptureQualification;
+use crate::capture::CaptureRecord;
 use crate::config::AppConfig;
 use crate::config::AppPaths;
 use crate::config::ConfigBundle;
 use crate::config::OptimizationSettings;
 use crate::config::ResolvedTaskConfig;
 use crate::config::load_or_initialize_config;
-use crate::lm::ModelHandle;
+use crate::inference::CandidateModel;
+use crate::inference::ExtractionError;
+use crate::inference::ExtractionReceipt;
+use crate::inference::InferenceBackend;
+use crate::inference::InferenceOptions;
+use crate::inference::LoggingPolicy;
+use crate::inference::ModelIdentity;
+use crate::inference::ModelRole;
+use crate::inference::OpenAiBackend;
+use crate::lm::AdapterKind;
 use crate::lm::TaskModelHandles;
-use crate::lm::disable_verbose_llm_logging;
-use crate::lm::enable_verbose_llm_logging;
 use crate::optimization::ExtractionProgram;
 use crate::optimization::GepaOutcome;
 use crate::optimization::GepaRunner;
 use crate::optimization::load_best_instruction;
 
-/// Schema validation behavior during inference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ValidationMode {
-    /// No validation performed
     None,
-    /// Validate and show warning if validation fails, but return the output
     Warn,
-    /// Validate and return error if validation fails
     Error,
 }
 
-/// Retry behavior when validation fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryMode {
-    /// No chat history - each attempt is independent
     Independent,
-    /// Include chat history and error message - LLM learns from previous attempts
     WithHistory,
 }
 
-/// High-level orchestrator for optimization and inference workflows.
+/// Engines own configuration only: construction never mutates model/log globals.
 #[derive(Debug)]
 pub struct ExtractionEngine {
     bundle: ConfigBundle,
 }
 
 impl ExtractionEngine {
-    /// Load configuration from disk (creating defaults if needed) and produce a
-    /// ready-to-use engine instance.
     pub fn load(app_name: impl AsRef<str>) -> Result<Self> {
-        let bundle = load_or_initialize_config(app_name)?;
-
-        // Enable/disable verbose LLM logging based on config
-        if bundle.config.logging.verbose_llm_logging {
-            let log_dir = Self::resolve_llm_log_dir(&bundle)?;
-            enable_verbose_llm_logging(log_dir);
-        } else {
-            disable_verbose_llm_logging();
-        }
-
-        Ok(Self { bundle })
+        Ok(Self {
+            bundle: load_or_initialize_config(app_name)?,
+        })
     }
 
-    /// Construct an engine from an existing [`ConfigBundle`]. Useful for tests.
     pub fn from_bundle(bundle: ConfigBundle) -> Self {
-        // Enable/disable verbose LLM logging based on config
-        if bundle.config.logging.verbose_llm_logging {
-            if let Ok(log_dir) = Self::resolve_llm_log_dir(&bundle) {
-                enable_verbose_llm_logging(log_dir);
-            }
-        } else {
-            disable_verbose_llm_logging();
-        }
-
         Self { bundle }
     }
 
     fn resolve_llm_log_dir(bundle: &ConfigBundle) -> Result<std::path::PathBuf> {
-        use crate::config::resolve_path_value;
-
         if let Some(custom_dir) = bundle.config.logging.llm_log_dir.as_ref() {
-            resolve_path_value(custom_dir, &bundle.paths.config_dir)
+            crate::config::resolve_path_value(custom_dir, &bundle.paths.config_dir)
         } else {
-            Ok(bundle.paths.state_dir.join("llm_logs"))
+            Ok(bundle.paths.state_dir.canonicalize()?.join("llm_logs"))
         }
     }
 
     pub fn config(&self) -> &AppConfig {
         &self.bundle.config
     }
-
     pub fn paths(&self) -> &AppPaths {
         &self.bundle.paths
     }
@@ -107,8 +84,7 @@ impl ExtractionEngine {
     }
 
     pub async fn task_models(&self, task_name: &str) -> Result<TaskModelHandles> {
-        let task = self.resolve_task(task_name)?;
-        TaskModelHandles::load(&task.models).await
+        TaskModelHandles::load(&self.resolve_task(task_name)?.models).await
     }
 
     pub async fn optimize_task(&self, task_name: &str) -> Result<GepaOutcome> {
@@ -121,7 +97,6 @@ impl ExtractionEngine {
         overrides: Option<OptimizationSettings>,
     ) -> Result<GepaOutcome> {
         let mut task = self.resolve_task(task_name)?;
-
         if let Some(override_settings) = overrides {
             let task_overrides = self.bundle.config.optimization.tasks.get(task_name);
             task.optimization = self
@@ -129,7 +104,6 @@ impl ExtractionEngine {
                 .config
                 .optimization
                 .resolve(Some(&override_settings), task_name)?;
-
             if let Some(existing_overrides) = task_overrides {
                 let merged = crate::config::merge_optimization_settings_public(
                     existing_overrides,
@@ -142,15 +116,12 @@ impl ExtractionEngine {
                     .resolve(Some(&merged), task_name)?;
             }
         }
-
         let models = TaskModelHandles::load(&task.models).await?;
         let optimization = task.optimization.clone();
-
         let log_dir = self.bundle.config.mlflow.log_dir.as_ref().map(|s| {
             let expanded = shellexpand::tilde(s);
             std::path::PathBuf::from(expanded.as_ref())
         });
-
         let runner = GepaRunner {
             task,
             optimization,
@@ -163,105 +134,148 @@ impl ExtractionEngine {
             local_logging: self.bundle.config.mlflow.local_logging,
             log_dir,
         };
-
         runner.run(&self.bundle.paths.state_dir).await
     }
 
+    /// Resolve an exact destination before explicitly granting it in request options.
+    pub fn fallback_identity(
+        &self,
+        task: &str,
+        role: ModelRole,
+    ) -> Result<ModelIdentity, ExtractionError> {
+        let task = self
+            .resolve_task(task)
+            .map_err(|_| ExtractionError::configuration())?;
+        let descriptor = match &role {
+            ModelRole::Student => &task.models.student,
+            ModelRole::Teacher => &task.models.teacher,
+            ModelRole::Fallback(index) => task
+                .models
+                .fallbacks
+                .get(*index)
+                .ok_or_else(ExtractionError::configuration)?,
+        };
+        let identity = ModelIdentity::from_descriptor(role, descriptor)?;
+        let credentials = crate::privacy::CredentialInventory::from_config(self.config());
+        if credentials.contains_text(&identity.name)
+            || credentials.contains_text(&identity.destination)
+        {
+            return Err(ExtractionError::configuration());
+        }
+        Ok(identity)
+    }
+
+    /// One typed inference seam. Configuration is not a grant to send to fallbacks.
     pub async fn run_inference(
         &self,
-        task_name: &str,
-        input_text: &str,
-        additional_context: Option<&str>,
-        verbose: bool,
-    ) -> Result<String> {
-        self.run_inference_with_validation(
-            task_name,
-            input_text,
-            additional_context,
-            verbose,
-            ValidationMode::None,
-            0,
-            RetryMode::Independent,
-        )
-        .await
+        task: &str,
+        input: &str,
+        context: Option<&str>,
+        options: &InferenceOptions,
+    ) -> Result<ExtractionReceipt, ExtractionError> {
+        let backend = OpenAiBackend::new()?;
+        self.run_inference_with_backend(task, input, context, options, &backend)
+            .await
     }
 
-    pub async fn run_inference_with_validation(
+    /// CPU-only tests and embedders can inject a request-local completion backend.
+    pub async fn run_inference_with_backend<B: InferenceBackend>(
         &self,
         task_name: &str,
         input_text: &str,
         additional_context: Option<&str>,
-        verbose: bool,
-        validation_mode: ValidationMode,
-        max_retries: u32,
-        retry_mode: RetryMode,
-    ) -> Result<String> {
-        self.run_inference_with_options(
-            task_name,
-            input_text,
-            additional_context,
-            verbose,
-            validation_mode,
-            max_retries,
-            retry_mode,
-            None,
+        options: &InferenceOptions,
+        backend: &B,
+    ) -> Result<ExtractionReceipt, ExtractionError> {
+        let credentials = crate::privacy::CredentialInventory::from_config(self.config());
+        let (schema, models, final_context) = self
+            .prepare_request(task_name, input_text, additional_context, options)
+            .map_err(|_| ExtractionError::configuration())?;
+        let log_dir = match &options.logging {
+            LoggingPolicy::Disabled => None,
+            LoggingPolicy::Directory(path) => Some(path.clone()),
+            LoggingPolicy::Config if self.bundle.config.logging.verbose_llm_logging => Some(
+                Self::resolve_llm_log_dir(&self.bundle)
+                    .map_err(|_| ExtractionError::configuration())?,
+            ),
+            LoggingPolicy::Config => None,
+        };
+        let mut receipt = crate::inference::execute(
+            &models,
+            &schema,
+            options,
+            backend,
+            &credentials,
+            log_dir.as_deref(),
         )
-        .await
-    }
-
-    pub async fn run_inference_with_options(
-        &self,
-        task_name: &str,
-        input_text: &str,
-        additional_context: Option<&str>,
-        verbose: bool,
-        validation_mode: ValidationMode,
-        max_retries: u32,
-        retry_mode: RetryMode,
-        max_tokens_override: Option<u32>,
-    ) -> Result<String> {
-        let mut task = self.resolve_task(task_name)?;
-
-        // Override max_tokens if specified
-        if let Some(max_tokens) = max_tokens_override {
-            task.models.student.max_tokens = Some(max_tokens);
-            task.models.teacher.max_tokens = Some(max_tokens);
-            for fallback in &mut task.models.fallbacks {
-                fallback.max_tokens = Some(max_tokens);
+        .await?;
+        let sensitive_source =
+            credentials.contains_text(input_text) || credentials.contains_text(&final_context);
+        if self.bundle.config.data_collection.enabled && sensitive_source {
+            receipt
+                .warnings
+                .push("candidate capture suppressed for sensitive source".into());
+        }
+        if self.bundle.config.data_collection.enabled && !sensitive_source {
+            let capture = (|| -> Result<()> {
+                let configured = self
+                    .config()
+                    .resolved_collection_dir(self.paths())?
+                    .ok_or_else(|| anyhow!("collection policy is disabled"))?;
+                let base = if self.config().data_collection.output_dir.is_some() {
+                    configured
+                } else {
+                    self.paths()
+                        .state_dir
+                        .canonicalize()?
+                        .join("collected_examples")
+                };
+                // Default capture retains accepted evidence and truthful failed-attempt
+                // metadata, not rejected completions or rejected parsed candidates.
+                let mut captured_receipt = receipt.clone();
+                for attempt in &mut captured_receipt.attempts {
+                    if matches!(attempt.outcome, crate::inference::AttemptOutcome::Failed(_)) {
+                        attempt.raw_completion = None;
+                        attempt.parsed = None;
+                        attempt.validation_errors.clear();
+                        if matches!(
+                            attempt.termination,
+                            Some(crate::inference::Termination::Other(_))
+                        ) {
+                            attempt.termination = Some(crate::inference::Termination::Unsupported);
+                        }
+                    }
+                }
+                let record = CaptureRecord {
+                    input_text: input_text.to_string(),
+                    additional_context: (!final_context.is_empty()).then_some(final_context),
+                    receipt: serde_json::to_value(&captured_receipt)?,
+                    qualification: CaptureQualification::Unreviewed,
+                };
+                crate::capture::capture_candidate(&base, task_name, &record)?;
+                Ok(())
+            })();
+            if capture.is_err() {
+                receipt.warnings.push("candidate capture failed".into());
             }
         }
+        Ok(receipt)
+    }
 
-        let models = TaskModelHandles::load(&task.models).await?;
-
-        let schema_path = task
-            .schema_path
-            .as_ref()
-            .ok_or_else(|| anyhow!("task '{task_name}' is missing schema path"))?;
-        let schema = std::fs::read_to_string(schema_path).with_context(|| {
-            format!(
-                "failed to read schema for task '{}' at {}",
-                task_name,
-                schema_path.display()
-            )
-        })?;
-
-        // Parse and compile schema if validation is enabled
-        let compiled_schema = if validation_mode != ValidationMode::None {
-            let schema_value: Value = serde_json::from_str(&schema)
-                .with_context(|| format!("failed to parse schema for task '{task_name}'"))?;
-
-            // JSONSchema requires 'static lifetime, so we Box::leak the value
-            let leaked_schema: &'static Value = Box::leak(Box::new(schema_value));
-            let compiled = JSONSchema::compile(leaked_schema)
-                .with_context(|| format!("failed to compile schema for task '{task_name}'"))?;
-
-            Some(compiled)
-        } else {
-            None
-        };
-
-        let mut program = ExtractionProgram::with_verbose(verbose);
-
+    fn prepare_request(
+        &self,
+        task_name: &str,
+        input_text: &str,
+        additional_context: Option<&str>,
+        options: &InferenceOptions,
+    ) -> Result<(String, Vec<CandidateModel>, String)> {
+        let task = self.resolve_task(task_name)?;
+        let schema = std::fs::read_to_string(
+            task.schema_path
+                .as_ref()
+                .ok_or_else(|| anyhow!("task is missing schema"))?,
+        )?;
+        let mut program = ExtractionProgram::new();
         if let Some(best) = load_best_instruction(&self.bundle.paths, task_name) {
             OptimizableTrait::update_signature_instruction(program.solver_mut(), best)?;
         } else if let Some(description) = &task.description {
@@ -273,96 +287,61 @@ impl ExtractionEngine {
             };
             OptimizableTrait::update_signature_instruction(program.solver_mut(), combined)?;
         }
-
         let mut context_parts = Vec::new();
-        if let Some(ctx) = additional_context
-            && !ctx.trim().is_empty()
-        {
-            context_parts.push(ctx.to_string());
+        // Preserve caller context, including whitespace. Never silently reduce input.
+        if let Some(context) = additional_context {
+            context_parts.push(context.to_string());
         }
-
         if task.include_timestamp {
-            let now = chrono::Local::now();
-            let timestamp = now.format("%A, %B %d, %Y at %I:%M %p %Z").to_string();
+            let timestamp = chrono::Local::now()
+                .format("%A, %B %d, %Y at %I:%M %p %Z")
+                .to_string();
             context_parts.push(format!("Current date and time: {timestamp}"));
         }
-
         let final_context = context_parts.join("\n\n");
-
-        let mut attempts: Vec<(&ModelHandle, String)> =
-            Vec::with_capacity(2 + models.fallbacks.len());
-        attempts.push((
-            &models.student,
-            format!("student '{}'", models.student.descriptor.name),
-        ));
-        attempts.push((
-            &models.teacher,
-            format!("teacher '{}'", models.teacher.descriptor.name),
-        ));
-        for fallback in &models.fallbacks {
-            attempts.push((fallback, format!("fallback '{}'", fallback.descriptor.name)));
-        }
-
-        let mut errors = Vec::new();
-        for (handle, label) in attempts {
-            handle.configure_global();
-
-            // Try with retries if enabled
-            let result = match retry_mode {
-                RetryMode::Independent => {
-                    self.try_inference_independent(
-                        &mut program,
-                        &schema,
-                        input_text,
-                        &final_context,
-                        compiled_schema.as_ref(),
-                        validation_mode,
-                        max_retries,
-                        verbose,
-                    )
-                    .await
-                }
-                RetryMode::WithHistory => {
-                    self.try_inference_with_history(
-                        &mut program,
-                        &schema,
-                        input_text,
-                        &final_context,
-                        compiled_schema.as_ref(),
-                        validation_mode,
-                        max_retries,
-                        verbose,
-                    )
-                    .await
-                }
-            };
-
-            match result {
-                Ok(output) => {
-                    self.maybe_collect_example(task_name, input_text, &final_context, &output);
-                    return Ok(output);
-                }
-                Err(err) => {
-                    errors.push(format!("{label}: {err}"));
-                    continue;
-                }
+        let signature = OptimizableTrait::get_signature(program.solver());
+        let mut descriptors = vec![
+            (ModelRole::Student, task.models.student),
+            (ModelRole::Teacher, task.models.teacher),
+        ];
+        descriptors.extend(
+            task.models
+                .fallbacks
+                .into_iter()
+                .enumerate()
+                .map(|(index, model)| (ModelRole::Fallback(index), model)),
+        );
+        let mut models = Vec::new();
+        for (role, mut descriptor) in descriptors {
+            if let Some(tokens) = options.max_tokens {
+                descriptor.max_tokens = Some(tokens);
             }
+            let identity = ModelIdentity::from_descriptor(role, &descriptor)?;
+            let credentials = crate::privacy::CredentialInventory::from_config(self.config());
+            if credentials.contains_text(&identity.name)
+                || credentials.contains_text(&identity.destination)
+            {
+                return Err(anyhow!("credential-bearing model identity"));
+            }
+            let adapter = AdapterKind::from_descriptor(&descriptor)?;
+            let inputs = example! {
+                "schema": "input" => &schema,
+                "input_text": "input" => input_text,
+                "additional_context": "input" => final_context.as_str(),
+                "image_data_uris": "input" => options.images.clone()
+            };
+            let messages = adapter.format_wire_messages(signature, inputs)?;
+            models.push(CandidateModel {
+                descriptor,
+                identity,
+                adapter,
+                messages,
+            });
         }
-
-        let summary = if errors.is_empty() {
-            "no models were available to run inference".to_string()
-        } else {
-            errors.join("; ")
-        };
-
-        Err(anyhow!(
-            "all configured models failed to produce valid output: {summary}"
-        ))
+        Ok((schema, models, final_context))
     }
 
-    /// Generate synthetic training examples for a task using the dataset_generator model.
-    ///
-    /// Returns a vector of raw examples that can be serialized to JSONL.
+    /// Generate examples using direct, local adapter dispatch rather than DSPy globals.
     pub async fn generate_examples(
         &self,
         task_name: &str,
@@ -370,32 +349,19 @@ impl ExtractionEngine {
         additional_context: Option<&str>,
     ) -> Result<Vec<crate::examples::RawTaskExample>> {
         let task = self.resolve_task(task_name)?;
-
-        // Get the dataset_generator model
         let generator_descriptor = task
             .models
             .dataset_generator
             .as_ref()
-            .ok_or_else(|| anyhow!("no dataset_generator model configured - add [models.defaults.dataset_generator] to your config.toml"))?;
-
+            .ok_or_else(|| anyhow!("no dataset_generator model configured"))?;
         let generator_model = crate::lm::build_model_handle(generator_descriptor)
             .await
             .context("failed to build dataset_generator model")?;
-
-        // Load the task's schema
-        let schema_path = task
-            .schema_path
-            .as_ref()
-            .ok_or_else(|| anyhow!("task '{task_name}' is missing schema path"))?;
-        let schema_content = std::fs::read_to_string(schema_path).with_context(|| {
-            format!(
-                "failed to read schema for task '{}' at {}",
-                task_name,
-                schema_path.display()
-            )
-        })?;
-
-        // Build the prompt for example generation
+        let schema_content = std::fs::read_to_string(
+            task.schema_path
+                .as_ref()
+                .ok_or_else(|| anyhow!("task is missing schema"))?,
+        )?;
         let mut context_parts = vec![format!("Generate {count} diverse training examples.")];
         if let Some(ctx) = additional_context {
             context_parts.push(ctx.to_string());
@@ -404,13 +370,8 @@ impl ExtractionEngine {
             context_parts.push(format!("Task description: {desc}"));
         }
         let context = context_parts.join("\n\n");
-
-        // Load the example_generator schema (embedded)
-        let example_generator_schema =
-            include_str!("../../examples/schemas/example_generator.json");
-
-        // System prompt for example generation
-        let system_prompt = r#"You are an expert at generating high-quality training examples for structured data extraction tasks.
+        let mut program = ExtractionProgram::new();
+        OptimizableTrait::update_signature_instruction(program.solver_mut(), r#"You are an expert at generating high-quality training examples for structured data extraction tasks.
 
 Given a target JSON schema, generate diverse and realistic examples that:
 1. Cover different input formats (emails, documents, forms, web pages, etc.)
@@ -418,384 +379,45 @@ Given a target JSON schema, generate diverse and realistic examples that:
 3. Represent realistic data with appropriate noise and variations
 4. Accurately extract the correct structured output
 
-Generate examples that would help train a model to perform the extraction task well."#;
-
+Generate examples that would help train a model to perform the extraction task well."#.to_string())?;
         let input_text =
             format!("Target Schema for extraction task '{task_name}':\n\n{schema_content}");
-
-        // Configure the generator model globally
-        generator_model.configure_global();
-
-        // Create extraction program and set the instruction
-        let mut program = ExtractionProgram::new();
-        OptimizableTrait::update_signature_instruction(
-            program.solver_mut(),
-            system_prompt.to_string(),
-        )?;
-
-        // Build the example for dspy
-        let dspy_example = example! {
-            "schema": "input" => example_generator_schema,
+        let signature = OptimizableTrait::get_signature(program.solver());
+        let response = generator_model.predict(signature, example! {
+            "schema": "input" => include_str!("../../examples/schemas/example_generator.json"),
             "input_text": "input" => &input_text,
             "additional_context": "input" => &context
-        };
-
-        let response = program.forward(dspy_example).await?;
-        let output_json = Self::extract_output_json(&response)?;
-
-        // Parse the response
-        let parsed: serde_json::Value = serde_json::from_str(&output_json)
-            .with_context(|| "failed to parse example generator output as JSON")?;
-
-        // Extract the examples array
-        let examples_array = parsed
+        }).await?;
+        let output = response.get("output_json", None);
+        let parsed: Value = serde_json::from_str(
+            output
+                .as_str()
+                .ok_or_else(|| anyhow!("missing generator output_json"))?,
+        )?;
+        let examples = parsed
             .get("examples")
-            .and_then(|e| e.as_array())
-            .ok_or_else(|| anyhow!("example generator output missing 'examples' array"))?;
-
-        let mut result = Vec::with_capacity(examples_array.len());
-        for (i, example_value) in examples_array.iter().enumerate() {
-            let ex_input_text = example_value
-                .get("input_text")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("example {} missing 'input_text'", i + 1))?
-                .to_string();
-
-            let expected_json = example_value
-                .get("expected_json")
-                .cloned()
-                .ok_or_else(|| anyhow!("example {} missing 'expected_json'", i + 1))?;
-
-            let ex_context = example_value
-                .get("additional_context")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            result.push(crate::examples::RawTaskExample {
-                input_text: ex_input_text,
-                expected_json,
-                additional_context: ex_context,
-                images: Vec::new(),
-            });
-        }
-
-        Ok(result)
-    }
-
-    async fn try_inference_independent(
-        &self,
-        program: &mut ExtractionProgram,
-        schema: &str,
-        input_text: &str,
-        additional_context: &str,
-        compiled_schema: Option<&JSONSchema>,
-        validation_mode: ValidationMode,
-        max_retries: u32,
-        verbose: bool,
-    ) -> Result<String> {
-        let attempts = max_retries + 1;
-
-        for attempt in 0..attempts {
-            let example = example! {
-                "schema": "input" => schema,
-                "input_text": "input" => input_text,
-                "additional_context": "input" => additional_context
-            };
-
-            let prediction = program.forward(example).await.context("inference failed")?;
-
-            let output = Self::extract_output_json(&prediction)?;
-
-            // Validate if schema validation is enabled
-            if let Some(compiled) = compiled_schema {
-                match Self::validate_with_compiled(&output, compiled) {
-                    Ok(_) => return Ok(output),
-                    Err(validation_err) => match validation_mode {
-                        ValidationMode::None => return Ok(output),
-                        ValidationMode::Warn => {
-                            eprintln!("Warning: Schema validation failed: {validation_err}");
-                            return Ok(output);
-                        }
-                        ValidationMode::Error => {
-                            if attempt < max_retries {
-                                if verbose {
-                                    eprintln!(
-                                        "Attempt {}: validation failed, retrying... ({validation_err})",
-                                        attempt + 1
-                                    );
-                                }
-                                continue;
-                            } else {
-                                return Err(anyhow!(
-                                    "schema validation failed after {attempts} attempts: {validation_err}"
-                                ));
-                            }
-                        }
-                    },
-                }
-            } else {
-                return Ok(output);
-            }
-        }
-
-        Err(anyhow!(
-            "failed to produce valid output after {attempts} attempts"
-        ))
-    }
-
-    async fn try_inference_with_history(
-        &self,
-        program: &mut ExtractionProgram,
-        schema: &str,
-        input_text: &str,
-        additional_context: &str,
-        compiled_schema: Option<&JSONSchema>,
-        validation_mode: ValidationMode,
-        max_retries: u32,
-        verbose: bool,
-    ) -> Result<String> {
-        let attempts = max_retries + 1;
-        let mut context_with_feedback = additional_context.to_string();
-
-        for attempt in 0..attempts {
-            let example = example! {
-                "schema": "input" => schema,
-                "input_text": "input" => input_text,
-                "additional_context": "input" => context_with_feedback.as_str()
-            };
-
-            let prediction = program.forward(example).await.context("inference failed")?;
-
-            let output = Self::extract_output_json(&prediction)?;
-
-            // Validate if schema validation is enabled
-            if let Some(compiled) = compiled_schema {
-                match Self::validate_with_compiled(&output, compiled) {
-                    Ok(_) => return Ok(output),
-                    Err(validation_err) => {
-                        match validation_mode {
-                            ValidationMode::None => return Ok(output),
-                            ValidationMode::Warn => {
-                                eprintln!("Warning: Schema validation failed: {validation_err}");
-                                return Ok(output);
-                            }
-                            ValidationMode::Error => {
-                                if attempt < max_retries {
-                                    if verbose {
-                                        eprintln!(
-                                            "Attempt {}: validation failed, retrying with feedback... ({validation_err})",
-                                            attempt + 1
-                                        );
-                                    }
-                                    // Add error feedback to context for next attempt
-                                    context_with_feedback = format!(
-                                        "{additional_context}\n\nPrevious attempt failed validation with error: {validation_err}\nPlease correct the output to match the schema."
-                                    );
-                                    continue;
-                                } else {
-                                    return Err(anyhow!(
-                                        "schema validation failed after {attempts} attempts: {validation_err}"
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                return Ok(output);
-            }
-        }
-
-        Err(anyhow!(
-            "failed to produce valid output after {attempts} attempts"
-        ))
-    }
-
-    fn validate_with_compiled(output: &str, compiled_schema: &JSONSchema) -> Result<()> {
-        let json: Value = serde_json::from_str(output).context("output is not valid JSON")?;
-
-        if let Err(errors) = compiled_schema.validate(&json) {
-            let error_messages: Vec<String> = errors.map(|e| format!("{e}")).collect();
-            return Err(anyhow!("validation errors: {}", error_messages.join("; ")));
-        }
-
-        Ok(())
-    }
-
-    fn maybe_collect_example(
-        &self,
-        task_name: &str,
-        input_text: &str,
-        additional_context: &str,
-        output_json: &str,
-    ) {
-        if !self.bundle.config.data_collection.enabled {
-            return;
-        }
-
-        if let Err(err) =
-            self.try_collect_example(task_name, input_text, additional_context, output_json)
-        {
-            eprintln!("Warning: failed to save collected example: {err}");
-        }
-    }
-
-    fn try_collect_example(
-        &self,
-        task_name: &str,
-        input_text: &str,
-        additional_context: &str,
-        output_json: &str,
-    ) -> Result<()> {
-        let Some(mut base_dir) = self
-            .bundle
-            .config
-            .resolved_collection_dir(&self.bundle.paths)?
-        else {
-            return Ok(());
-        };
-
-        let task_component = sanitize_for_filename(task_name);
-        base_dir.push(&task_component);
-        std::fs::create_dir_all(&base_dir).with_context(|| {
-            format!(
-                "failed to create collected examples directory {}",
-                base_dir.display()
-            )
-        })?;
-
-        let parsed_output: serde_json::Value =
-            serde_json::from_str(output_json).context("collected output is not valid JSON")?;
-
-        let record = CollectedExample {
-            input_text,
-            expected_json: parsed_output,
-            additional_context: (!additional_context.trim().is_empty())
-                .then_some(additional_context),
-            images: Vec::new(),
-        };
-
-        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.subsec_millis())
-            .unwrap_or(0);
-        let filename = format!("{timestamp}_{task_component}_{millis:03}.json");
-        let file_path = base_dir.join(filename);
-        let serialized = serde_json::to_string_pretty(&record)?;
-        std::fs::write(&file_path, serialized).with_context(|| {
-            format!(
-                "failed to write collected example to {}",
-                file_path.display()
-            )
-        })?;
-
-        Ok(())
-    }
-
-    fn extract_output_json(prediction: &dspy_rs::Prediction) -> Result<String> {
-        let raw_value = prediction.get("output_json", None);
-
-        fn strip_code_fence(text: &str) -> Option<String> {
-            let trimmed = text.trim();
-            if !trimmed.starts_with("```") {
-                return None;
-            }
-            let mut parts = trimmed.splitn(2, '\n');
-            parts.next()?;
-            let remainder = parts.next()?.trim();
-            let end = remainder.rfind("```")?;
-            Some(remainder[..end].trim().to_string())
-        }
-
-        let make_object_string = |value: serde_json::Value| -> Result<String> {
-            match value {
-                serde_json::Value::String(inner) => {
-                    if inner.trim().is_empty() {
-                        Err(anyhow!("response contained an empty output_json string"))
-                    } else {
-                        Ok(inner)
-                    }
-                }
-                serde_json::Value::Object(_) | serde_json::Value::Array(_) => Ok(value.to_string()),
-                other => {
-                    let rendered = other.to_string();
-                    if rendered.trim().is_empty() || rendered == "null" {
-                        Err(anyhow!("response contained empty output_json value"))
-                    } else {
-                        Ok(rendered)
-                    }
-                }
-            }
-        };
-
-        match raw_value {
-            serde_json::Value::Null => Err(anyhow!("model response missing 'output_json' field")),
-            serde_json::Value::String(s) => {
-                let trimmed = s.trim();
-                if trimmed.is_empty() {
-                    return Err(anyhow!(
-                        "model response returned empty 'output_json' string"
-                    ));
-                }
-
-                let candidate = strip_code_fence(trimmed).unwrap_or_else(|| trimmed.to_string());
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&candidate) {
-                    if let serde_json::Value::String(inner) = parsed {
-                        if inner.trim().is_empty() {
-                            Err(anyhow!(
-                                "model response encoded an empty JSON string for 'output_json'"
-                            ))
-                        } else {
-                            Ok(inner)
-                        }
-                    } else if matches!(
-                        parsed,
-                        serde_json::Value::Object(_) | serde_json::Value::Array(_)
-                    ) {
-                        Ok(parsed.to_string())
-                    } else {
-                        make_object_string(parsed)
-                    }
-                } else {
-                    Ok(candidate)
-                }
-            }
-            other @ serde_json::Value::Object(_) | other @ serde_json::Value::Array(_) => {
-                make_object_string(other)
-            }
-            other => make_object_string(other),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct CollectedExample<'a> {
-    input_text: &'a str,
-    expected_json: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    additional_context: Option<&'a str>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    images: Vec<String>,
-}
-
-fn sanitize_for_filename(task_name: &str) -> String {
-    let mut sanitized = String::with_capacity(task_name.len());
-    let mut last_was_sep = false;
-    for ch in task_name.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '-' {
-            sanitized.push(ch);
-            last_was_sep = false;
-        } else if !last_was_sep {
-            sanitized.push('_');
-            last_was_sep = true;
-        }
-    }
-
-    let trimmed = sanitized.trim_matches('_').to_string();
-    if trimmed.is_empty() {
-        "task".to_string()
-    } else {
-        trimmed
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("generator output missing examples"))?;
+        examples
+            .iter()
+            .map(|value| {
+                Ok(crate::examples::RawTaskExample {
+                    input_text: value
+                        .get("input_text")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow!("generated example missing input_text"))?
+                        .to_string(),
+                    expected_json: value
+                        .get("expected_json")
+                        .cloned()
+                        .ok_or_else(|| anyhow!("generated example missing expected_json"))?,
+                    additional_context: value
+                        .get("additional_context")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    images: Vec::new(),
+                })
+            })
+            .collect()
     }
 }

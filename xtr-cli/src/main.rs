@@ -1,5 +1,8 @@
 use anyhow::Context;
 use anyhow::Result;
+use clap::Args;
+use clap::CommandFactory;
+use clap::FromArgMatches;
 use clap::Parser;
 use clap::Subcommand;
 use clap::ValueEnum;
@@ -68,6 +71,33 @@ struct Cli {
     command: Commands,
 }
 
+impl Cli {
+    /// Derive parsing preserves each argument's values; Clap indices restore the
+    /// shared ordering across file/stdin and base64 image arguments.
+    fn parse_ordered() -> Result<Self> {
+        let matches = Self::command().get_matches();
+        let mut cli = Self::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+        if let Commands::Get(args) = &mut cli.command {
+            let get = matches
+                .subcommand_matches("get")
+                .context("missing get arguments")?;
+            let mut images: Vec<_> = get
+                .indices_of("image")
+                .unwrap_or_default()
+                .zip(args.image.drain(..).map(CliImage::Path))
+                .chain(
+                    get.indices_of("image_base64")
+                        .unwrap_or_default()
+                        .zip(args.image_base64.drain(..).map(CliImage::Base64)),
+                )
+                .collect();
+            images.sort_by_key(|(index, _)| *index);
+            args.ordered_images = images.into_iter().map(|(_, image)| image).collect();
+        }
+        Ok(cli)
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     #[command(about = "Show configuration and task information")]
@@ -116,42 +146,7 @@ enum Commands {
     },
 
     #[command(about = "Run inference on input text")]
-    Get {
-        #[arg(help = "Task name")]
-        task: String,
-
-        #[arg(long, help = "Input text to process (reads from stdin if omitted)")]
-        text: Option<String>,
-
-        #[arg(long, help = "Optional additional context")]
-        context: Option<String>,
-
-        #[arg(
-            long,
-            value_enum,
-            default_value = "none",
-            help = "Schema validation mode"
-        )]
-        validate: CliValidationMode,
-
-        #[arg(
-            long,
-            short = 'r',
-            default_value = "0",
-            help = "Number of retry attempts on validation failure"
-        )]
-        retry: u32,
-
-        #[arg(
-            long,
-            short = 's',
-            help = "Use shots mode (with chat history) instead of independent retries"
-        )]
-        shots: bool,
-
-        #[arg(long, short = 'm', help = "Override max_tokens for this request")]
-        max_tokens: Option<u32>,
-    },
+    Get(GetArgs),
 
     #[command(about = "Set the active optimization run for a task")]
     Activate {
@@ -199,6 +194,100 @@ enum Commands {
     },
 }
 
+/// One inference invocation, including its input sources and admission grants.
+#[derive(Args)]
+struct GetArgs {
+    #[arg(help = "Task name")]
+    task: String,
+
+    #[arg(long, help = "Input text to process (reads from stdin if omitted)")]
+    text: Option<String>,
+
+    #[arg(long, help = "Optional additional context")]
+    context: Option<String>,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value = "none",
+        help = "Schema validation mode"
+    )]
+    validate: CliValidationMode,
+
+    #[arg(
+        long,
+        short = 'r',
+        default_value = "0",
+        help = "Number of retry attempts on validation failure"
+    )]
+    retry: u32,
+
+    #[arg(
+        long,
+        short = 's',
+        help = "Use shots mode (with chat history) instead of independent retries"
+    )]
+    shots: bool,
+
+    #[arg(long, short = 'm', help = "Override max_tokens for this request")]
+    max_tokens: Option<u32>,
+
+    #[arg(
+        long,
+        help = "Image file (repeatable); 'stdin' reads binary image bytes"
+    )]
+    image: Vec<PathBuf>,
+
+    #[arg(long, help = "Standard base64 image bytes (repeatable)")]
+    image_base64: Vec<String>,
+
+    /// Normalized by Cli::parse_ordered before input is read or sent.
+    #[arg(skip)]
+    ordered_images: Vec<CliImage>,
+
+    #[arg(
+        long,
+        help = "Grant exact configured destination: teacher or fallback:N (zero-based)"
+    )]
+    allow_fallback: Vec<String>,
+
+    #[arg(long, help = "Accept missing finish metadata as explicitly unverified")]
+    allow_unknown_termination: bool,
+
+    #[arg(
+        long,
+        help = "Print full private audit receipt instead of parsed extraction"
+    )]
+    receipt: bool,
+}
+
+enum CliImage {
+    Path(PathBuf),
+    Base64(String),
+}
+
+/// Approval deliberately takes a separate label file, never a predicted label.
+#[derive(Args)]
+struct ApproveArgs {
+    #[arg(help = "Task whose schema validates the supplied labels")]
+    task: String,
+
+    #[arg(long)]
+    candidate: PathBuf,
+
+    #[arg(long, help = "Separate reviewed JSON label file")]
+    expected: PathBuf,
+
+    #[arg(long)]
+    reviewer: String,
+
+    #[arg(
+        long,
+        help = "Private directory for non-clobbering approved example output"
+    )]
+    output_dir: PathBuf,
+}
+
 #[derive(Subcommand)]
 enum CreateCommands {
     #[command(about = "Generate a JSON schema from a JSON file")]
@@ -216,6 +305,10 @@ enum CreateCommands {
 
 #[derive(Subcommand)]
 enum ExamplesCommands {
+    #[command(
+        about = "Approve a candidate using independently reviewed labels (never auto-promote predictions)"
+    )]
+    Approve(ApproveArgs),
     #[command(about = "Convert examples between JSON directory and JSONL formats")]
     Convert {
         #[arg(help = "Input path (directory of .json files or .jsonl file)")]
@@ -269,7 +362,7 @@ enum ExamplesCommands {
 async fn main() -> Result<()> {
     increase_fd_limit()?;
 
-    let cli = Cli::parse();
+    let cli = Cli::parse_ordered()?;
     let engine = ExtractionEngine::load("xtr")?;
 
     match cli.command {
@@ -329,55 +422,7 @@ async fn main() -> Result<()> {
             );
             println!("Optimized instruction saved to state directory.");
         }
-        Commands::Get {
-            task,
-            text,
-            context,
-            validate,
-            retry,
-            shots,
-            max_tokens,
-        } => {
-            let input_text = match text {
-                Some(t) => t,
-                None => {
-                    let mut buffer = String::new();
-                    io::stdin()
-                        .read_to_string(&mut buffer)
-                        .context("failed to read from stdin")?;
-                    buffer
-                }
-            };
-
-            let validation_mode = validate.into();
-            let retry_mode = if shots {
-                xtr_core::RetryMode::WithHistory
-            } else {
-                xtr_core::RetryMode::Independent
-            };
-
-            let output = engine
-                .run_inference_with_options(
-                    &task,
-                    &input_text,
-                    context.as_deref(),
-                    cli.verbose,
-                    validation_mode,
-                    retry,
-                    retry_mode,
-                    max_tokens,
-                )
-                .await?;
-
-            if cli.verbose {
-                println!("{output}");
-            } else {
-                match serde_json::from_str::<serde_json::Value>(&output) {
-                    Ok(json) => println!("{}", serde_json::to_string_pretty(&json)?),
-                    Err(_) => println!("{output}"),
-                }
-            }
-        }
+        Commands::Get(args) => handle_get(&engine, args).await?,
         Commands::Activate { task, run } => {
             commands::handle_activate(&engine, &task, &run)?;
         }
@@ -413,6 +458,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Examples { command } => match command {
+            ExamplesCommands::Approve(args) => handle_examples_approve(&engine, args)?,
             ExamplesCommands::Convert { input, output, to } => {
                 handle_examples_convert(&input, output.as_deref(), to.as_deref())?;
             }
@@ -440,6 +486,122 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve invocation-specific input and grants, then render its result or error.
+async fn handle_get(engine: &ExtractionEngine, args: GetArgs) -> Result<()> {
+    let (input_text, images) = read_inputs(args.text, &args.ordered_images)?;
+    let mut options = xtr_core::InferenceOptions {
+        validation: args.validate.into(),
+        max_retries: args.retry,
+        retry_mode: if args.shots {
+            xtr_core::RetryMode::WithHistory
+        } else {
+            xtr_core::RetryMode::Independent
+        },
+        max_tokens: args.max_tokens,
+        allow_unknown_termination: args.allow_unknown_termination,
+        images,
+        ..Default::default()
+    };
+    for grant in args.allow_fallback {
+        let role = if grant == "teacher" {
+            xtr_core::inference::ModelRole::Teacher
+        } else if let Some(index) = grant.strip_prefix("fallback:") {
+            xtr_core::inference::ModelRole::Fallback(
+                index.parse().context("fallback index must be an integer")?,
+            )
+        } else {
+            anyhow::bail!("fallback grant must be teacher or fallback:N");
+        };
+        options
+            .allowed_fallbacks
+            .push(engine.fallback_identity(&args.task, role)?);
+    }
+    match engine
+        .run_inference(&args.task, &input_text, args.context.as_deref(), &options)
+        .await
+    {
+        Ok(result) => {
+            for warning in &result.warnings {
+                eprintln!("Warning: {warning}");
+            }
+            if result.validation == xtr_core::inference::ValidationStatus::Failed {
+                eprintln!("Warning: extraction failed schema validation (warn mode)");
+            }
+            let output = if args.receipt {
+                serde_json::to_value(result)?
+            } else {
+                result.parsed
+            };
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        Err(error) => {
+            if args.receipt {
+                println!("{}", serde_json::to_string_pretty(&error)?);
+            }
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+/// Validate independent labels before publishing a private approved example.
+fn handle_examples_approve(engine: &ExtractionEngine, args: ApproveArgs) -> Result<()> {
+    let record: xtr_core::capture::CaptureRecord =
+        serde_json::from_slice(&fs::read(&args.candidate)?)?;
+    let labels: serde_json::Value = serde_json::from_slice(&fs::read(&args.expected)?)?;
+    let schema_path = engine
+        .resolve_task(&args.task)?
+        .schema_path
+        .context("task has no schema")?;
+    xtr_core::schema::validate_labels(&fs::read_to_string(schema_path)?, &labels)?;
+    let approved = xtr_core::capture::approve_candidate(&record, labels, &args.reviewer)?;
+    let mut value = serde_json::to_value(approved)?;
+    value["approval"] = serde_json::json!({
+        "reviewer": args.reviewer,
+        "source_candidate": args.candidate,
+        "reviewed_at": chrono::Utc::now().to_rfc3339(),
+        "policy": "independent_labels"
+    });
+    let path = xtr_core::capture::write_private_json(&args.output_dir, &value)?;
+    println!("{}", path.display());
+    Ok(())
+}
+
+fn read_inputs(text: Option<String>, sources: &[CliImage]) -> Result<(String, Vec<String>)> {
+    let stdin_images = sources
+        .iter()
+        .filter(|source| matches!(source, CliImage::Path(path) if path.as_os_str() == "stdin"))
+        .count();
+    anyhow::ensure!(stdin_images <= 1, "stdin image may only be supplied once");
+    let mut images = Vec::with_capacity(sources.len());
+    for source in sources {
+        let input = match source {
+            CliImage::Path(path) if path.as_os_str() == "stdin" => {
+                let mut bytes = Vec::new();
+                io::stdin()
+                    .read_to_end(&mut bytes)
+                    .context("failed to read stdin image")?;
+                xtr_core::ImageInput::from_bytes(bytes)
+            }
+            CliImage::Path(path) => xtr_core::ImageInput::from_path(path),
+            CliImage::Base64(payload) => xtr_core::ImageInput::from_base64(payload),
+        };
+        images.push(input.to_data_uri()?);
+    }
+    let input_text = match text {
+        Some(text) => text,
+        None if stdin_images > 0 => String::new(),
+        None => {
+            let mut text = String::new();
+            io::stdin()
+                .read_to_string(&mut text)
+                .context("failed to read stdin text")?;
+            text
+        }
+    };
+    Ok((input_text, images))
 }
 
 fn handle_examples_convert(

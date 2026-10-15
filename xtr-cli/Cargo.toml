@@ -17,6 +17,9 @@ serde_json.workspace = true
 chrono.workspace = true
 json-schema-generator.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [[bin]]
 name = "xtr"
 path = "src/main.rs"

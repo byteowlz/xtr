@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Typed extraction receipts/errors, explicit per-request fallback grants and
+  provider termination/usage evidence (`--receipt`).
+- File/base64/stdin vision input with lossless multimodal current/demo turns.
+- Private atomic unreviewed candidate capture and separate reviewed-label approval.
+
 - **Configurable metrics per task** (`MetricKind`): choose how an extraction is
   scored via `[tasks.<name>.metric].kind` — `schema_field` (default, existing
   heuristic), `exact`, `llm_judge`, or `command`.
@@ -43,6 +48,13 @@ All notable changes to this project will be documented in this file.
   tests.
 
 ### Fixes
+
+- Parse complete JSON before handling strict outer envelopes; never repair literals
+  or recover ambiguous/prose fragments.
+- Bind extraction model, adapter and logging destination to each request, and
+  release owned compiled validators without leaked schema allocations.
+- Reject length-limited/refused completions even when their JSON validates;
+  require explicit opt-in for missing termination metadata.
 
 - Removed production `unwrap`/`expect` in `xtr-cli` and `xtr-core`
   (`strip_think_tags` now uses a lazily-initialized static regex, `log_dir`

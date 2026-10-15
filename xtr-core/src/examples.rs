@@ -10,6 +10,8 @@ use anyhow::Result;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::media::ImageInput;
+
 /// Representation of a single training example loaded from a `.json` file.
 #[derive(Debug, Clone)]
 pub struct TaskExample {
@@ -21,8 +23,19 @@ pub struct TaskExample {
 }
 
 impl TaskExample {
-    pub fn to_training_example(&self, schema: &str, include_timestamp: bool) -> dspy_rs::Example {
-        let expected_str = serde_json::to_string(&self.expected_json).unwrap_or_default();
+    /// Preserve text and context while encoding every image as an input data URI.
+    /// Unreadable or unsupported images fail conversion rather than being omitted.
+    pub fn to_training_example(
+        &self,
+        schema: &str,
+        include_timestamp: bool,
+    ) -> Result<dspy_rs::Example> {
+        let expected_str = serde_json::to_string(&self.expected_json)?;
+        let image_data_uris: Vec<String> = self
+            .image_paths
+            .iter()
+            .map(|path| ImageInput::File(path.clone()).to_data_uri())
+            .collect::<Result<_>>()?;
 
         let mut context_parts = Vec::new();
         if let Some(ctx) = &self.additional_context
@@ -39,13 +52,15 @@ impl TaskExample {
 
         let final_context = context_parts.join("\n\n");
 
-        dspy_rs::example! {
+        let example = dspy_rs::example! {
             "schema": "input" => schema,
             "input_text": "input" => &self.input_text,
             "additional_context": "input" => final_context.as_str(),
+            "image_data_uris": "input" => image_data_uris,
             "expected_output": "input" => expected_str,
             "example_name": "input" => &self.name
-        }
+        };
+        Ok(example)
     }
 }
 
@@ -325,5 +340,124 @@ fn generate_template_from_schema(schema: &serde_json::Value) -> serde_json::Valu
         Some("boolean") => Value::Bool(false),
         Some("null") => Value::Null,
         _ => Value::Null,
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "tests use assertions while propagating fixture and conversion errors"
+)]
+mod training_tests {
+    use super::*;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use serde_json::Value;
+    use serde_json::json;
+
+    fn task_example(image_paths: Vec<PathBuf>) -> TaskExample {
+        TaskExample {
+            name: "synthetic-example".to_string(),
+            input_text: "Read the images without losing this text.".to_string(),
+            expected_json: json!({ "answer": "synthetic" }),
+            additional_context: Some("Keep this context too.".to_string()),
+            image_paths,
+        }
+    }
+
+    #[test]
+    fn training_images_preserve_bytes_order_and_text_fields() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let fixtures = [
+            ("image/png", b"\x89PNG\r\n\x1a\n\x00\xfffirst".as_slice()),
+            ("image/gif", b"GIF89a\x00\x80second".as_slice()),
+        ];
+        let mut paths = Vec::new();
+        for (index, (_, bytes)) in fixtures.iter().enumerate() {
+            let path = dir.path().join(format!("image-{index}.bin"));
+            fs::write(&path, bytes)?;
+            paths.push(path);
+        }
+        let task = task_example(paths);
+        let schema = r#"{"type":"object"}"#;
+        let example = task.to_training_example(schema, false)?;
+        let uris = example.get("image_data_uris", None);
+        let uris = uris.as_array().context("Images must be a JSON array")?;
+        assert_eq!(uris.len(), fixtures.len());
+        for (uri, (mime, bytes)) in uris.iter().zip(fixtures) {
+            let uri = uri.as_str().context("Image URI must be a string")?;
+            let prefix = format!("data:{mime};base64,");
+            let payload = uri.strip_prefix(&prefix).context("Incorrect image MIME")?;
+            assert_eq!(STANDARD.decode(payload)?, bytes);
+        }
+        assert!(
+            example
+                .input_keys
+                .iter()
+                .any(|key| key == "image_data_uris")
+        );
+        assert_eq!(example.get("schema", None), json!(schema));
+        assert_eq!(example.get("input_text", None), json!(task.input_text));
+        assert_eq!(
+            example.get("additional_context", None),
+            json!(task.additional_context)
+        );
+        assert_eq!(example.get("example_name", None), json!(task.name));
+        let expected = example.get("expected_output", None);
+        let expected = expected
+            .as_str()
+            .context("Expected output must be a string")?;
+        assert_eq!(serde_json::from_str::<Value>(expected)?, task.expected_json);
+        Ok(())
+    }
+
+    #[test]
+    fn text_only_training_keeps_empty_image_array() -> Result<()> {
+        let mut task = task_example(Vec::new());
+        task.additional_context = None;
+        let example = task.to_training_example("schema", false)?;
+        assert_eq!(example.get("image_data_uris", None), json!([]));
+        assert_eq!(example.get("input_text", None), json!(task.input_text));
+        assert_eq!(example.get("additional_context", None), json!(""));
+        Ok(())
+    }
+
+    #[test]
+    fn timestamp_does_not_replace_context_or_images() -> Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        fs::write(file.path(), b"GIF89a")?;
+        let task = task_example(vec![file.path().to_path_buf()]);
+        let example = task.to_training_example("schema", true)?;
+        let context = example.get("additional_context", None);
+        let context = context.as_str().context("Context must be a string")?;
+        assert!(context.starts_with("Keep this context too.\n\nCurrent date and time: "));
+        assert_eq!(example.get("input_text", None), json!(task.input_text));
+        assert_eq!(
+            example.get("image_data_uris", None),
+            json!(["data:image/gif;base64,R0lGODlh"])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_image_fails_even_after_valid_image() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let valid = dir.path().join("valid.gif");
+        fs::write(&valid, b"GIF89a")?;
+        let missing = dir.path().join("missing.png");
+        let task = task_example(vec![valid, missing]);
+        assert!(task.to_training_example("schema", false).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_or_empty_image_is_not_silently_omitted() -> Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        for bytes in [b"not an image".as_slice(), b""] {
+            fs::write(file.path(), bytes)?;
+            let task = task_example(vec![file.path().to_path_buf()]);
+            assert!(task.to_training_example("schema", false).is_err());
+        }
+        Ok(())
     }
 }

@@ -11,9 +11,10 @@ XTR extracts structured data from unstructured text using language models and au
 - **Schema-driven extraction**: Define JSON schemas for your data structures
 - **Schema validation**: Validate outputs during inference with configurable modes (none, warn, error)
 - **Smart retries**: Automatic retry with independent attempts or LLM learning from errors
-- **Multi-model fallback**: Teacher/student model architecture with fallback support
+- **Auditable inference**: Typed receipts, termination checks, request-local logging and explicit fallback grants
+- **Vision inputs**: Lossless file/base64/stdin images in multimodal messages
 - **Auto-optimization**: GEPA algorithm improves extraction quality over time
-- **Local & cloud models**: Works with OpenAI, Anthropic, local LLMs (LM Studio, Ollama, etc.)
+- **Compatible endpoints**: OpenAI-compatible cloud/local LM and VLM APIs (including LM Studio, Ollama and gateways)
 - **MLflow integration**: Track optimization experiments and results
 
 ## Quick Start
@@ -41,6 +42,16 @@ cat input.txt | xtr get event --validate error --retry 3 --shots
 
 # Override max_tokens for this request
 cat large_input.txt | xtr get event --max-tokens 4096
+
+# Inspect private provenance (raw completion, attempts, validation and usage)
+xtr get event --text "Synthetic event" --receipt
+
+# Explicitly permit the configured teacher destination after student failure
+xtr get event --text "Synthetic event" --allow-fallback teacher
+
+# Image plus text, or binary image stdin
+xtr get screen_context --text "Describe this screen" --image screen.png
+ctx capture | xtr get screen_context --image stdin
 
 # Optimize extraction for a task
 xtr optimize contact_details
@@ -70,16 +81,12 @@ max_tokens = 2048  # Optional: can be overridden per-request with --max-tokens
 
 ### Using Local Models (LM Studio, Ollama)
 
-When using local model servers with explicit `base_url`, **avoid provider prefixes** in model names (e.g., use `qwen3-coder-30b` instead of `qwen/qwen3-coder-30b`). The underlying dspy-rs library detects provider prefixes (`openai/`, `anthropic/`, `qwen/`, etc.) and automatically rewrites the `base_url` to the cloud service endpoint, ignoring your explicit configuration.
+Inference sends the exact configured model name to the configured OpenAI-compatible
+`base_url`; prefixes/slashes do not change the destination. Provider-native SDK
+compatibility is not implied by an OpenAI-compatible endpoint. Optimization still
+uses DSPy's provider client behavior.
 
-**Workaround for LM Studio models with slashes:**
-
-LM Studio requires the exact model ID including the slash (e.g., `qwen/qwen3-coder-30b`). Since dspy-rs will override your `base_url`, you have two options:
-
-1. **Use model alias/renaming** in LM Studio (if supported by your version)
-2. **Use Ollama instead**, which doesn't require slashes in model names
-
-Example for LM Studio (use model name without prefix if possible):
+Example for LM Studio:
 
 ```toml
 [models.defaults.student]
@@ -98,8 +105,6 @@ base_url = "http://localhost:11434/v1"
 api_key = "not_needed"
 adapter = "chat"
 ```
-
-**Note**: This is a limitation of the dspy-rs dependency. Weare tracking this issue and will provide a proper fix in a future release.
 
 ### Context Length Considerations
 
@@ -215,7 +220,19 @@ enabled = true
 output_dir = "$XDG_STATE_HOME/xtr/collected_examples"
 ```
 
-When enabled, every `xtr get` run saves the input text, optional additional context, and parsed model output to `collected_examples/<task>/...json` using the same schema as your curated examples. You can move or edit these files before feeding them back into your task's examples directory.
+Successful calls save private, atomic **unreviewed candidates** with receipt provenance,
+not `expected_json` training labels. Failed completion content and source media are
+not collected. Existing records are not migrated. Training loaders reject candidate
+records; independently review labels before explicitly approving a separate example:
+
+```bash
+xtr examples approve event --candidate candidate.json --expected reviewed-labels.json \
+  --reviewer reviewer-id --output-dir private-approved-examples
+```
+
+New Unix directories/files are 0700/0600; existing non-private directories or
+symlink paths are rejected rather than rewritten. Capture failures are reported
+as warnings without misrepresenting successful extraction.
 
 ## Optimization
 
@@ -362,13 +379,22 @@ Lower temperature for refining near-optimal solutions.
 
 XTR supports runtime schema validation during inference with configurable retry behavior.
 
-### Automatic Think Tag Stripping
+### Response Admission
 
-XTR automatically strips `<think>...</think>` tags from model outputs during inference. This is useful for models that use chain-of-thought reasoning in their responses. The reasoning content is removed before JSON parsing, ensuring clean extraction results.
+Complete JSON is parsed before any envelope handling, preserving literals. Only
+one strict outer `<think>...</think>` block and/or complete lowercase `json` fence
+is supported; prose fragments, truncated or multiple payloads are rejected.
+`length` and refusal responses fail even when their JSON validates. Missing finish
+metadata is unknown and rejected unless `--allow-unknown-termination` explicitly
+accepts an unverified receipt. Student-only is the default; fallbacks need explicit
+`--allow-fallback teacher` or `--allow-fallback fallback:N` grants.
+
+See [the extraction contract and regression evidence](docs/adr/0002-request-owned-extraction.md)
+for library migration, privacy, retries, capture and vision boundaries.
 
 ### Validation Modes
 
-**None (default)**: No validation, return output as-is
+**None (default)**: No schema validation; JSON/termination admission still applies
 ```bash
 xtr get contact_details < input.txt
 ```
@@ -474,13 +500,8 @@ The model returned a response but didn't follow the expected JSON format. Try:
 
 ### Model names with provider prefixes (e.g., `qwen/`, `anthropic/`)
 
-When using **cloud APIs** (OpenAI, Anthropic, etc.), provider prefixes in model names work correctly:
-
-- `openai/gpt-4o` → routes to `https://api.openai.com/v1`
-- `anthropic/claude-3.5-sonnet` → routes to `https://api.anthropic.com/v1`
-- `qwen/qwen3-coder-30b` → routes to `https://dashscope-intl.aliyuncs.com`
-
-However, when using **local servers with explicit `base_url`**, remove provider prefixes from model names to prevent dspy-rs from overriding your endpoint configuration. Use model names without slashes: `gpt-4o`, `claude-3.5-sonnet`, `qwen3-coder-30b`, etc.
+For inference, use the exact model ID accepted by the configured compatible
+endpoint. XTR does not reinterpret its prefix or silently select another destination.
 
 ## Development
 

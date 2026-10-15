@@ -14,12 +14,17 @@
     )
 )]
 
+pub mod capture;
 pub mod config;
 pub mod engine;
 pub mod examples;
+pub mod inference;
 pub mod lm;
+pub mod media;
 pub mod mlflow_logger;
 pub mod optimization;
+mod privacy;
+pub mod schema;
 
 pub use config::AppConfig;
 pub use config::AppPaths;
@@ -44,10 +49,14 @@ pub use examples::convert_json_dir_to_jsonl;
 pub use examples::convert_jsonl_to_json_dir;
 pub use examples::generate_example_template;
 pub use examples::load_task_examples;
+pub use inference::ExtractionError;
+pub use inference::ExtractionReceipt;
+pub use inference::InferenceOptions;
 pub use lm::AdapterKind;
 pub use lm::ModelHandle;
 pub use lm::TaskModelHandles;
 pub use lm::build_model_handle;
+pub use media::ImageInput;
 pub use optimization::GepaOutcome;
 pub use optimization::GepaRunner;
 pub use optimization::load_best_instruction;

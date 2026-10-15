@@ -1,8 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::LazyLock;
-use std::sync::Mutex;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -19,133 +16,10 @@ use dspy_rs::Prediction;
 use dspy_rs::adapter::Adapter;
 use dspy_rs::serde_utils::get_iter_from_value;
 use rig::tool::ToolDyn;
-use serde::Deserialize;
-use serde::Serialize;
 use serde_json::Value;
 
 use crate::config::ModelDescriptor;
 use crate::config::ResolvedModelConfig;
-
-/// Matches ” thinking... response ” tags (case-insensitive, multi-line) to strip.
-#[expect(
-    clippy::expect_used,
-    reason = "regex pattern is a compile-time literal that is guaranteed valid"
-)]
-static THINK_TAGS_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?is) thinking.*? response").expect("valid static regex"));
-
-/// Global state for verbose LLM logging
-static VERBOSE_LLM_LOGGING: Mutex<Option<PathBuf>> = Mutex::new(None);
-
-/// Enable verbose LLM logging to the specified directory
-pub fn enable_verbose_llm_logging(log_dir: PathBuf) {
-    if let Ok(mut guard) = VERBOSE_LLM_LOGGING.lock() {
-        *guard = Some(log_dir);
-    }
-}
-
-/// Disable verbose LLM logging
-pub fn disable_verbose_llm_logging() {
-    if let Ok(mut guard) = VERBOSE_LLM_LOGGING.lock() {
-        *guard = None;
-    }
-}
-
-/// Get the LLM log directory if logging is enabled
-fn get_llm_log_dir() -> Option<PathBuf> {
-    VERBOSE_LLM_LOGGING.lock().ok()?.clone()
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LlmLogEntry {
-    timestamp: String,
-    model: String,
-    request: LlmRequest,
-    response: LlmResponse,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LlmRequest {
-    messages: Value,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LlmResponse {
-    content: String,
-    usage: Option<LlmUsageInfo>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LlmUsageInfo {
-    total_tokens: u64,
-    prompt_tokens: Option<u64>,
-    completion_tokens: Option<u64>,
-}
-
-fn log_llm_interaction(
-    model: &str,
-    messages: &Chat,
-    response_content: &str,
-    usage: &dspy_rs::LmUsage,
-) {
-    if let Some(log_dir) = get_llm_log_dir()
-        && let Err(err) =
-            try_log_llm_interaction(model, messages, response_content, usage, &log_dir)
-    {
-        eprintln!("Warning: failed to write LLM log: {err}");
-    }
-}
-
-fn try_log_llm_interaction(
-    model: &str,
-    messages: &Chat,
-    response_content: &str,
-    usage: &dspy_rs::LmUsage,
-    log_dir: &PathBuf,
-) -> Result<()> {
-    use std::fs;
-    use std::time::SystemTime;
-
-    // Ensure log directory exists
-    fs::create_dir_all(log_dir)
-        .with_context(|| format!("failed to create LLM log directory {}", log_dir.display()))?;
-
-    // Convert Chat to JSON value for the request
-    let request_json = messages.to_json();
-
-    let log_entry = LlmLogEntry {
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        model: model.to_string(),
-        request: LlmRequest {
-            messages: request_json,
-        },
-        response: LlmResponse {
-            content: response_content.to_string(),
-            usage: Some(LlmUsageInfo {
-                total_tokens: usage.total_tokens,
-                prompt_tokens: Some(usage.prompt_tokens),
-                completion_tokens: Some(usage.completion_tokens),
-            }),
-        },
-    };
-
-    // Generate filename with timestamp and random suffix
-    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
-    let millis = SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_millis())
-        .unwrap_or(0);
-    let filename = format!("{timestamp}_llm_{millis:03}.json");
-    let file_path = log_dir.join(filename);
-
-    // Write JSON log
-    let json =
-        serde_json::to_string_pretty(&log_entry).context("failed to serialize LLM log entry")?;
-    fs::write(&file_path, json)
-        .with_context(|| format!("failed to write LLM log to {}", file_path.display()))?;
-
-    Ok(())
-}
 
 #[derive(Default, Clone)]
 struct JsonAdapter;
@@ -209,78 +83,36 @@ impl JsonAdapter {
         (user, Value::Object(response_object).to_string())
     }
 
-    fn strip_think_tags(text: &str) -> String {
-        THINK_TAGS_RE.replace_all(text, "").trim().to_string()
-    }
-
+    /// Accept one complete JSON value (any root type), without rewriting literals.
+    /// Optional envelopes are exactly one leading, non-nested `<think>...</think>`
+    /// block, then optionally one lowercase `json` code fence. Fence delimiters
+    /// must occupy their own lines (LF or CRLF); outer whitespace is allowed.
+    /// Prose, brace fragments, nested/repeated envelopes, multiple values and
+    /// truncated payloads are rejected, never repaired or partially recovered.
     fn extract_json_payload(raw: &str) -> Option<Value> {
-        // First strip any <think> tags
-        let cleaned = Self::strip_think_tags(raw);
-        let trimmed = cleaned.trim();
-
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        if let Ok(value) = serde_json::from_str::<Value>(raw) {
             return Some(value);
         }
 
-        if let Some(stripped) = Self::strip_code_fence(trimmed)
-            && let Ok(value) = serde_json::from_str::<Value>(&stripped)
-        {
-            return Some(value);
-        }
-
-        if let Some(fragment) = Self::extract_braced_fragment(trimmed)
-            && let Ok(value) = serde_json::from_str::<Value>(&fragment)
-        {
-            return Some(value);
-        }
-
-        None
-    }
-
-    fn strip_code_fence(text: &str) -> Option<String> {
-        let trimmed = text.trim();
-        if !trimmed.starts_with("```") {
-            return None;
-        }
-
-        let mut parts = trimmed.splitn(2, '\n');
-        parts.next()?;
-        let remainder = parts.next()?.trim();
-        let end = remainder.rfind("```")?;
-        Some(remainder[..end].trim().to_string())
-    }
-
-    fn extract_braced_fragment(text: &str) -> Option<String> {
-        Self::extract_balanced_fragment(text, '{', '}')
-    }
-
-    fn extract_balanced_fragment(text: &str, open: char, close: char) -> Option<String> {
-        let mut depth = 0usize;
-        let mut start = None;
-
-        for (idx, ch) in text.char_indices() {
-            if ch == open {
-                if start.is_none() {
-                    start = Some(idx);
-                }
-                depth += 1;
-            } else if ch == close {
-                if depth == 0 {
-                    continue;
-                }
-                depth -= 1;
-                if depth == 0 {
-                    let begin = start?;
-                    return Some(text[begin..=idx].to_string());
-                }
+        let mut payload = raw.trim();
+        if let Some(reasoning) = payload.strip_prefix("<think>") {
+            let (body, remainder) = reasoning.split_once("</think>")?;
+            if body.contains("<think>") {
+                return None;
             }
+            payload = remainder.trim();
         }
 
-        None
+        if let Some(fenced) = Self::strip_code_fence(payload) {
+            payload = fenced;
+        }
+        serde_json::from_str::<Value>(payload).ok()
+    }
+
+    fn strip_code_fence(text: &str) -> Option<&str> {
+        text.strip_prefix("```json\n")
+            .or_else(|| text.strip_prefix("```json\r\n"))?
+            .strip_suffix("\n```")
     }
 
     fn parse_response_payload(content: &str) -> HashMap<String, Value> {
@@ -315,13 +147,225 @@ impl JsonAdapter {
                 Value::String(payload.to_string()),
             );
         } else {
+            // Preserve rejected responses verbatim for downstream validation/evidence.
             data.insert(
                 "output_json".to_string(),
-                Value::String(content.trim().to_string()),
+                Value::String(content.to_string()),
             );
         }
 
         data
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "test assertions report mismatches; Result propagates fixture setup errors"
+)]
+mod parser_tests {
+    use super::JsonAdapter;
+    use anyhow::Result;
+    use anyhow::anyhow;
+    use serde_json::Value;
+    use serde_json::json;
+
+    #[test]
+    fn literal_safe_preserves_thinking_response_note() -> Result<()> {
+        let raw = r#"{"output_json":{"note":"needs thinking before response selection"}}"#;
+        let expected = json!({"note": "needs thinking before response selection"});
+        let payload = JsonAdapter::extract_json_payload(raw)
+            .ok_or_else(|| anyhow!("expected complete JSON payload"))?;
+        assert_eq!(payload["output_json"], expected);
+
+        let parsed = JsonAdapter::parse_response_payload(raw);
+        let output = parsed["output_json"]
+            .as_str()
+            .ok_or_else(|| anyhow!("expected output_json string"))?;
+        assert_eq!(serde_json::from_str::<Value>(output)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn literal_safe_complete_json_table() -> Result<()> {
+        let cases = [
+            (
+                "marker words",
+                json!({"note": "needs thinking before response selection"}),
+            ),
+            (
+                "literal tags",
+                json!({"note": "<think>thinking</think> response ```json ```"}),
+            ),
+            (
+                "unicode",
+                json!({"note": "Grüße 東京 Ω thinking before response"}),
+            ),
+            (
+                "escapes",
+                json!({"note": "quoted \"thinking before response\" and C:\\tmp\\file"}),
+            ),
+            ("braces", json!({"note": "} { [ ] \\"})),
+            (
+                "nested",
+                json!({"items": [{"note": "} thinking before response {", "list": [null, true, 42]}]}),
+            ),
+            (
+                "array root",
+                json!([{"note": "thinking before response"}, [1, 2]]),
+            ),
+            (
+                "string root",
+                json!("<think>thinking before response</think> { }"),
+            ),
+            ("number root", json!(12.5)),
+            ("boolean root", json!(true)),
+            ("null root", Value::Null),
+        ];
+        for (name, expected) in cases {
+            let raw = serde_json::to_string(&expected)?;
+            assert_eq!(
+                JsonAdapter::extract_json_payload(&raw),
+                Some(expected.clone()),
+                "{name}"
+            );
+
+            let parsed = JsonAdapter::parse_response_payload(&raw);
+            let output = parsed["output_json"]
+                .as_str()
+                .ok_or_else(|| anyhow!("expected output_json string for {name}"))?;
+            assert_eq!(serde_json::from_str::<Value>(output)?, expected, "{name}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn literal_safe_envelope_and_wrapper_table() -> Result<()> {
+        let expected = json!({
+            "note": "needs thinking before response selection <think>literal</think>",
+            "items": [{"quoted": "\" } { \\"}, [true, null, "東京"]]
+        });
+        let output = serde_json::to_string(&expected)?;
+        let payloads = [
+            ("bare", expected.clone()),
+            (
+                "object output_json",
+                json!({"reasoning": "thinking before response", "output_json": expected}),
+            ),
+            (
+                "string output_json",
+                json!({"reasoning": "<think>literal</think>", "output_json": output}),
+            ),
+        ];
+        for (name, expected_payload) in payloads {
+            let raw = serde_json::to_string(&expected_payload)?;
+            let envelopes = [
+                raw.clone(),
+                format!(" \n{raw}\t "),
+                format!("<think>thinking before response\nreasoning</think>\n{raw}"),
+                format!("```json\n{raw}\n```"),
+                format!(" \r\n```json\r\n{raw}\r\n```\r\n "),
+                format!("<think>reasoning</think>\n```json\n{raw}\n```"),
+            ];
+            for response in envelopes {
+                assert_eq!(
+                    JsonAdapter::extract_json_payload(&response),
+                    Some(expected_payload.clone()),
+                    "{name}: {response}"
+                );
+                let parsed = JsonAdapter::parse_response_payload(&response);
+                let parsed_output = parsed["output_json"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("expected output_json string for {name}"))?;
+                assert_eq!(
+                    serde_json::from_str::<Value>(parsed_output)?,
+                    expected,
+                    "{name}"
+                );
+                if let Some(reasoning) = expected_payload.get("reasoning") {
+                    assert_eq!(parsed.get("reasoning"), Some(reasoning), "{name}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn literal_safe_rejects_recovery_table() {
+        let cases = [
+            ("empty", " \n\t "),
+            (
+                "prose prefix",
+                "Here is JSON: {\"note\":\"thinking before response\"}",
+            ),
+            ("prose suffix", "{\"note\":\"unchanged\"} done"),
+            (
+                "quoted prose fragment",
+                r#"Answer: {"note":"} thinking before response {"}"#,
+            ),
+            ("two objects", "{\"first\":1} {\"second\":2}"),
+            ("two roots", "[] null"),
+            ("truncated object", "{\"nested\":{\"valid\":true}"),
+            ("truncated array", "[{\"valid\":true}"),
+            ("truncated string", "{\"note\":\"unfinished}"),
+            ("invalid escape", r#"{"note":"bad\q"}"#),
+            ("unclosed think", "<think>reasoning {\"valid\":true}"),
+            ("closing think only", "</think>{}"),
+            ("nested think", "<think><think>nested</think></think>{}"),
+            ("repeated think", "<think>one</think><think>two</think>{}"),
+            ("uppercase think", "<THINK>reasoning</THINK>{}"),
+            ("think after JSON", "{}<think>reasoning</think>"),
+            ("prose after think", "<think>reasoning</think>answer: {}"),
+            ("multiple after think", "<think>reasoning</think>{} {}"),
+            ("truncated after think", "<think>reasoning</think>[{}"),
+            ("unclosed fence", "```json\n{}"),
+            ("unlabeled fence", "```\n{}\n```"),
+            ("wrong fence language", "```python\n{}\n```"),
+            ("uppercase fence language", "```JSON\n{}\n```"),
+            ("inline opening fence", "```json {}\n```"),
+            ("inline closing fence", "```json\n{}```"),
+            ("fence suffix prose", "```json\n{}\n``` done"),
+            ("two fences", "```json\n{}\n```\n```json\n{}\n```"),
+            ("nested fences", "```json\n```json\n{}\n```\n```"),
+            ("multiple fenced values", "```json\n{} {}\n```"),
+            ("truncated fenced value", "```json\n[{\"valid\":true}\n```"),
+            (
+                "think inside fence",
+                "```json\n<think>reasoning</think>{}\n```",
+            ),
+        ];
+        for (name, raw) in cases {
+            assert_eq!(JsonAdapter::extract_json_payload(raw), None, "{name}");
+            let parsed = JsonAdapter::parse_response_payload(raw);
+            assert_eq!(
+                parsed.get("output_json"),
+                Some(&Value::String(raw.to_string())),
+                "raw evidence: {name}"
+            );
+            assert_eq!(parsed.len(), 1, "{name}");
+        }
+    }
+
+    #[test]
+    fn literal_safe_parsed_output_passes_exact_schema_validation() -> Result<()> {
+        let note = "needs thinking before response selection";
+        let schema = json!({
+            "type": "object",
+            "properties": {"note": {"type": "string", "const": note}},
+            "required": ["note"],
+            "additionalProperties": false
+        });
+        let validator = jsonschema::JSONSchema::compile(&schema)
+            .map_err(|err| anyhow!("failed to compile synthetic schema: {err}"))?;
+        let response = r#"{"output_json":{"note":"needs thinking before response selection"}}"#;
+        let parsed = JsonAdapter::parse_response_payload(response);
+        let output = parsed["output_json"]
+            .as_str()
+            .ok_or_else(|| anyhow!("expected output_json string"))?;
+        let extracted = serde_json::from_str::<Value>(output)?;
+        assert!(validator.is_valid(&extracted));
+        assert_eq!(extracted["note"], note);
+        Ok(())
     }
 }
 
@@ -373,14 +417,6 @@ impl Adapter for JsonAdapter {
         let response = lm.call(messages.clone(), vec![]).await?;
         let prompt_str = response.chat.to_json().to_string();
 
-        // Log the complete request-response cycle if verbose logging is enabled
-        log_llm_interaction(
-            &lm.model,
-            &messages,
-            &response.output.content(),
-            &response.usage,
-        );
-
         let data = self.parse_response(signature, response.output.clone());
         let prediction = Prediction {
             data,
@@ -411,14 +447,14 @@ impl Adapter for JsonAdapter {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdapterKind {
     Chat,
     Json,
 }
 
 impl AdapterKind {
-    fn from_descriptor(descriptor: &ModelDescriptor) -> Result<Self> {
+    pub(crate) fn from_descriptor(descriptor: &ModelDescriptor) -> Result<Self> {
         match descriptor
             .adapter
             .as_deref()
@@ -435,11 +471,181 @@ impl AdapterKind {
         }
     }
 
-    pub fn install(self, lm: LM) {
+    pub(crate) fn format_messages(self, signature: &dyn MetaSignature, inputs: Example) -> Chat {
         match self {
-            Self::Chat => dspy_rs::configure(lm, ChatAdapter),
-            Self::Json => dspy_rs::configure(lm, JsonAdapter),
+            Self::Json => JsonAdapter.format(signature, inputs),
+            Self::Chat => ChatAdapter.format(signature, inputs),
         }
+    }
+
+    /// Wire formatting preserves every demo/current user turn and its images.
+    pub(crate) fn format_wire_messages(
+        self,
+        signature: &dyn MetaSignature,
+        inputs: Example,
+    ) -> Result<Value> {
+        let mut examples = signature.demos();
+        examples.push(inputs.clone());
+        let mut messages = self.format_messages(signature, inputs).to_json();
+        let turns = messages
+            .as_array_mut()
+            .ok_or_else(|| anyhow!("invalid messages"))?;
+        let mut users = turns.iter_mut().filter(|turn| turn["role"] == "user");
+        for example in examples {
+            let user = users.next().ok_or_else(|| anyhow!("missing user turn"))?;
+            let images = example.get("image_data_uris", None);
+            if images.is_null() {
+                continue;
+            }
+            let images = images
+                .as_array()
+                .ok_or_else(|| anyhow!("image_data_uris must be an array"))?;
+            if images.is_empty() {
+                continue;
+            }
+            let text = user["content"]
+                .as_str()
+                .ok_or_else(|| anyhow!("invalid user content"))?;
+            let mut image_inputs = Vec::with_capacity(images.len());
+            for uri in images {
+                let uri = uri
+                    .as_str()
+                    .ok_or_else(|| anyhow!("image URI must be a string"))?;
+                let (_, encoded) = uri
+                    .split_once(',')
+                    .ok_or_else(|| anyhow!("invalid image URI"))?;
+                let image = crate::media::ImageInput::from_base64(encoded);
+                if image.to_data_uri()? != uri {
+                    return Err(anyhow!("image URI MIME/content mismatch"));
+                }
+                image_inputs.push(image);
+            }
+            user["content"] = crate::media::multimodal_content(text, &image_inputs)?;
+        }
+        Ok(messages)
+    }
+
+    pub(crate) fn decoded_envelope(self, content: &str) -> Option<Value> {
+        match self {
+            Self::Json => JsonAdapter::extract_json_payload(content),
+            Self::Chat => None,
+        }
+    }
+
+    pub(crate) fn decode_extraction(self, content: &str) -> Result<Value> {
+        match self {
+            Self::Json => {
+                let payload = JsonAdapter::extract_json_payload(content)
+                    .ok_or_else(|| anyhow!("response is not one complete JSON payload"))?;
+                if let Some(output) = payload.as_object().and_then(|map| map.get("output_json")) {
+                    if let Some(encoded) = output.as_str() {
+                        serde_json::from_str(encoded).context("output_json is not complete JSON")
+                    } else {
+                        Ok(output.clone())
+                    }
+                } else {
+                    Ok(payload)
+                }
+            }
+            Self::Chat => {
+                let program = crate::optimization::ExtractionProgram::new();
+                let signature = dspy_rs::core::Optimizable::get_signature(program.solver());
+                let data = ChatAdapter.parse_response(signature, Message::assistant(content));
+                let output = data
+                    .get("output_json")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("legacy response is missing output_json"))?;
+                JsonAdapter::extract_json_payload(output)
+                    .ok_or_else(|| anyhow!("legacy output_json is not complete JSON"))
+            }
+        }
+    }
+
+    /// Only the non-concurrent DSPy optimization workflow installs globals.
+    pub fn install(self, lm: LM) {
+        dspy_rs::configure(lm, RequestAdapter { kind: self });
+    }
+}
+
+/// DSPy's Chat is text-only, so multimodal calls use the same compatible wire
+/// transport directly. Text-only optimization calls retain their existing cache.
+#[derive(Clone)]
+struct RequestAdapter {
+    kind: AdapterKind,
+}
+
+#[async_trait::async_trait]
+impl Adapter for RequestAdapter {
+    fn format(&self, signature: &dyn MetaSignature, inputs: Example) -> Chat {
+        self.kind.format_messages(signature, inputs)
+    }
+
+    fn parse_response(
+        &self,
+        signature: &dyn MetaSignature,
+        response: Message,
+    ) -> HashMap<String, Value> {
+        match self.kind {
+            AdapterKind::Json => JsonAdapter.parse_response(signature, response),
+            AdapterKind::Chat => ChatAdapter.parse_response(signature, response),
+        }
+    }
+
+    async fn call(
+        &self,
+        lm: Arc<LM>,
+        signature: &dyn MetaSignature,
+        inputs: Example,
+        tools: Vec<Arc<dyn ToolDyn>>,
+    ) -> Result<Prediction> {
+        let mut examples = signature.demos();
+        examples.push(inputs.clone());
+        let has_images = examples.iter().any(|example| {
+            let images = example.get("image_data_uris", None);
+            !images.is_null() && images != serde_json::json!([])
+        });
+        if !has_images {
+            return match self.kind {
+                AdapterKind::Json => JsonAdapter.call(lm, signature, inputs, tools).await,
+                AdapterKind::Chat => ChatAdapter.call(lm, signature, inputs, tools).await,
+            };
+        }
+        if !tools.is_empty() {
+            return Err(anyhow!("multimodal extraction does not execute tools"));
+        }
+        use crate::inference::InferenceBackend;
+        let descriptor = ModelDescriptor {
+            name: lm.model.clone(),
+            base_url: lm.base_url.clone(),
+            api_key: lm.api_key.clone(),
+            adapter: None,
+            request_timeout_secs: None,
+            max_tokens: Some(lm.max_tokens),
+        };
+        let messages = self.kind.format_wire_messages(signature, inputs)?;
+        let completion = crate::inference::OpenAiBackend::new()?
+            .complete(&descriptor, &messages)
+            .await
+            .map_err(|failure| anyhow!("multimodal completion failed: {failure:?}"))?;
+        if completion.termination != crate::inference::Termination::Stop {
+            return Err(anyhow!(
+                "multimodal completion did not report a normal stop"
+            ));
+        }
+        let raw = completion
+            .raw
+            .ok_or_else(|| anyhow!("completion is missing text"))?;
+        self.kind.decode_extraction(&raw)?;
+        let usage = completion.usage.unwrap_or_default();
+        Ok(Prediction {
+            data: self.parse_response(signature, Message::assistant(raw)),
+            // DSPy's optimizer requires numerical usage, unlike extraction receipts.
+            lm_usage: dspy_rs::LmUsage {
+                prompt_tokens: usage.prompt_tokens.unwrap_or(0),
+                completion_tokens: usage.completion_tokens.unwrap_or(0),
+                total_tokens: usage.total_tokens.unwrap_or(0),
+            },
+        })
     }
 }
 
@@ -451,6 +657,17 @@ pub struct ModelHandle {
 }
 
 impl ModelHandle {
+    /// Direct adapter dispatch avoids DSPy's configure/forward global transaction.
+    pub async fn predict(
+        &self,
+        signature: &dyn MetaSignature,
+        inputs: Example,
+    ) -> Result<Prediction> {
+        RequestAdapter { kind: self.adapter }
+            .call(Arc::new(self.lm.clone()), signature, inputs, vec![])
+            .await
+    }
+
     pub fn configure_global(&self) {
         self.adapter.install(self.lm.clone());
     }

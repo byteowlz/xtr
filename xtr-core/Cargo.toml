@@ -28,8 +28,8 @@ mlflow_rs = { version = "0.1", optional = true }
 chrono.workspace = true
 regex.workspace = true
 rig-core.workspace = true
-
-[dev-dependencies]
+reqwest.workspace = true
+base64.workspace = true
 tempfile.workspace = true
 
 [lints]
